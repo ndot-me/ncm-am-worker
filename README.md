@@ -31,8 +31,7 @@ cd ncm-am-worker && npm install
 ### 2. 创建 KV
 
 ```bash
-wrangler kv namespace create CONFIG
-wrangler kv namespace create STATE
+wrangler kv namespace create NCM_AM
 # 把输出的 ID 填入 wrangler.toml
 ```
 
