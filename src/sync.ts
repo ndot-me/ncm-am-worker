@@ -11,6 +11,7 @@ import type { Env, SyncResult } from './types';
 
 const PLAYLIST_PREFIX_DEFAULT = 'NCM Daily ';
 const KEEP_DAYS_DEFAULT = 3;
+const STOREFRONT_DEFAULT = 'jp';
 
 /**
  * Get valid NCM cookie — check login, refresh if needed, save to KV.
@@ -58,7 +59,7 @@ async function getValidCookie(env: Env): Promise<string> {
 export async function sync(env: Env): Promise<SyncResult> {
   const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
   const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
-  const storefront = env.STOREFRONT || 'cn';
+  const storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
 
   // Time in UTC+8
   const now = new Date(Date.now() + 8 * 3600 * 1000);
