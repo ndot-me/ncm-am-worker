@@ -20,13 +20,17 @@ import type { NcmSongDisplay, SongMatch, SyncResponse } from './app-types';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
-import { Separator } from '@/components/ui/separator';
 
 type LogEntry = { id: string; tone: 'info' | 'success' | 'error'; message: string };
+type StatusPayload = {
+  ncm: { ok: boolean; uid?: string; nickname?: string; refreshed?: boolean; error?: string };
+  push: { subscribers: number };
+  activeSession: SyncResponse | null;
+};
 
 const STORAGE_TOKEN = 'ncm_am_token';
 const STORAGE_SESSION = 'ncm_am_session';
@@ -70,26 +74,142 @@ function percent(processed: number, total: number): number {
   return Math.round((processed / total) * 100);
 }
 
-function SongArtwork({ song }: { song: Pick<NcmSongDisplay, 'cover' | 'name'> }) {
-  if (!song.cover) {
+function phaseStatusLabel(status: 'pending' | 'running' | 'done' | 'error'): string {
+  switch (status) {
+    case 'running':
+      return '进行中';
+    case 'done':
+      return '已完成';
+    case 'error':
+      return '失败';
+    default:
+      return '待执行';
+  }
+}
+
+function normalizeImageUrl(url?: string | null): string {
+  return (url || '').replace(/^http:\/\//, 'https://');
+}
+
+function formatNcmAccount(statusInfo: StatusPayload | null): string {
+  if (!statusInfo) return '-';
+  if (!statusInfo.ncm.ok) return statusInfo.ncm.error || '未登录';
+  return [statusInfo.ncm.nickname || '已登录', statusInfo.ncm.uid ? `UID ${statusInfo.ncm.uid}` : null]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function ArtworkImage({
+  src,
+  alt,
+  imageClassName,
+  fallbackClassName,
+  iconClassName,
+}: {
+  src?: string | null;
+  alt: string;
+  imageClassName: string;
+  fallbackClassName: string;
+  iconClassName: string;
+}) {
+  const [failed, setFailed] = useState(!src);
+
+  useEffect(() => {
+    setFailed(!src);
+  }, [src]);
+
+  if (!src || failed) {
     return (
-      <div className="flex h-14 w-14 items-center justify-center rounded-xl border border-dashed border-border bg-muted/60">
-        <Music4 className="size-5 text-muted-foreground" />
+      <div className={fallbackClassName}>
+        <Music4 className={iconClassName} />
       </div>
     );
   }
-  return <img src={song.cover} alt={song.name} className="h-14 w-14 rounded-xl object-cover" />;
+
+  return (
+    <img
+      src={normalizeImageUrl(src)}
+      alt={alt}
+      className={imageClassName}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+function SongArtwork({ song }: { song: Pick<NcmSongDisplay, 'cover' | 'name'> }) {
+  return (
+    <ArtworkImage
+      src={song.cover}
+      alt={song.name}
+      imageClassName="h-14 w-14 rounded-xl object-cover"
+      fallbackClassName="flex h-14 w-14 items-center justify-center rounded-xl border border-dashed border-border bg-muted/60"
+      iconClassName="size-5 text-muted-foreground"
+    />
+  );
 }
 
 function CandidateArtwork({ candidate }: { candidate: SongMatch['candidates'][number] }) {
-  if (!candidate.artworkUrl) {
+  return (
+    <ArtworkImage
+      src={candidate.artworkUrl}
+      alt={candidate.name}
+      imageClassName="h-12 w-12 rounded-lg object-cover"
+      fallbackClassName="flex h-12 w-12 items-center justify-center rounded-lg border border-dashed border-border bg-muted/50"
+      iconClassName="size-4 text-muted-foreground"
+    />
+  );
+}
+
+function SearchStateStatus({ song }: { song: SongMatch }) {
+  if (song.status === 'matched') {
     return (
-      <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-dashed border-border bg-muted/50">
-        <Music4 className="size-4 text-muted-foreground" />
+      <div className="text-right">
+        <div className="flex items-center justify-end gap-2 text-emerald-500">
+          <div className="flex size-6 items-center justify-center rounded-full bg-emerald-500/15">
+            <Check className="size-4" />
+          </div>
+          <span className="text-sm font-medium">已匹配</span>
+        </div>
+        <div className="mt-1 max-w-52 truncate text-xs text-muted-foreground">
+          {song.selectedCandidate ? `${song.selectedCandidate.name} · ${song.selectedCandidate.artist}` : '已找到候选'}
+        </div>
       </div>
     );
   }
-  return <img src={candidate.artworkUrl} alt={candidate.name} className="h-12 w-12 rounded-lg object-cover" />;
+
+  if (song.status === 'needs_review') {
+    return (
+      <div className="text-right">
+        <Badge variant="warning">待确认</Badge>
+        <div className="mt-1 text-xs text-muted-foreground">{song.candidates.length} 个候选</div>
+      </div>
+    );
+  }
+
+  if (song.status === 'error') {
+    return (
+      <div className="text-right">
+        <Badge variant="destructive">搜索失败</Badge>
+      </div>
+    );
+  }
+
+  if (song.status === 'skipped') {
+    return (
+      <div className="text-right">
+        <Badge variant="outline">已跳过</Badge>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 text-muted-foreground">
+      <Loader2 className="size-4 animate-spin" />
+      <span className="text-sm">搜索中</span>
+    </div>
+  );
 }
 
 function StatCard({
@@ -127,6 +247,7 @@ export default function App() {
   const [pushSupported, setPushSupported] = useState(true);
   const [pushSubscribed, setPushSubscribed] = useState(false);
   const [vapidKey, setVapidKey] = useState('');
+  const [statusInfo, setStatusInfo] = useState<StatusPayload | null>(null);
 
   const addLog = useCallback((tone: LogEntry['tone'], message: string) => {
     setLogs((current) => [{ id: makeId(), tone, message }, ...current].slice(0, 40));
@@ -169,6 +290,19 @@ export default function App() {
     },
     [token],
   );
+
+  const refreshStatus = useCallback(async () => {
+    if (!token) {
+      setStatusInfo(null);
+      return;
+    }
+    try {
+      const nextStatus = await api<StatusPayload>('/status');
+      setStatusInfo(nextStatus);
+    } catch {
+      setStatusInfo(null);
+    }
+  }, [api, token]);
 
   const refreshPushState = useCallback(async () => {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -395,6 +529,10 @@ export default function App() {
   }, [auto, payload?.sessionId, saveAuth, token]);
 
   useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  useEffect(() => {
     if (!bootToken || token !== bootToken) return;
 
     const savedSession = localStorage.getItem(STORAGE_SESSION) || '';
@@ -451,7 +589,6 @@ export default function App() {
               </div>
               <div>
                 <CardTitle>NCM → Apple Music</CardTitle>
-                <CardDescription>shadcn/ui 风格控制台，带 lucide 图标和多阶段同步状态。</CardDescription>
               </div>
             </div>
           </CardHeader>
@@ -460,15 +597,16 @@ export default function App() {
               <label className="text-sm font-medium">Sync Token</label>
               <Input value={token} type="password" onChange={(event) => setToken(event.target.value)} placeholder="输入 token" />
             </div>
-            <label className="flex items-start gap-3 rounded-lg border border-border/70 bg-muted/30 p-4 text-sm">
+            <label className="flex items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-4 text-sm">
               <Checkbox checked={auto} onChange={(event) => setAuto(event.target.checked)} />
-              <span>
-                <span className="font-medium">Automatic Skip Missing Songs</span>
-                <span className="mt-1 block text-muted-foreground">
-                  phase 2 中未确认的歌曲会直接跳过，并继续创建歌单。
-                </span>
-              </span>
+              <span className="font-medium">Automatic Skip Missing Songs</span>
             </label>
+            {statusInfo ? (
+              <div className="rounded-lg border border-border/70 bg-muted/20 p-4 text-sm">
+                <div className="mb-1 text-muted-foreground">网易云账户</div>
+                <div className="font-medium">{formatNcmAccount(statusInfo)}</div>
+              </div>
+            ) : null}
             {authError ? (
               <Alert variant="destructive">
                 <AlertTitle>无法开始</AlertTitle>
@@ -504,9 +642,9 @@ export default function App() {
               </div>
               <div>
                 <CardTitle>会话 {payload.sessionId.slice(0, 8)}</CardTitle>
-                <CardDescription>
+                <div className="text-sm text-muted-foreground">
                   {formatStatus(payload)} · {payload.data.storefront || '-'} 区 · {payload.data.accountLabel}
-                </CardDescription>
+                </div>
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -520,15 +658,21 @@ export default function App() {
               {payload.status === 'error' ? <Badge variant="destructive">错误</Badge> : null}
             </div>
           </div>
-          <div className="flex flex-wrap gap-3">
-            <Button variant="secondary" onClick={() => void refreshSession()}>
-              <RefreshCw />
-              刷新状态
-            </Button>
-            <Button variant="default" onClick={() => void startSync()}>
-              <Sparkles />
-              新建会话
-            </Button>
+          <div className="space-y-3">
+            <div className="flex flex-wrap justify-end gap-3">
+              <Button variant="secondary" onClick={() => void refreshSession()}>
+                <RefreshCw />
+                刷新状态
+              </Button>
+              <Button variant="default" onClick={() => void startSync()}>
+                <Sparkles />
+                新建会话
+              </Button>
+            </div>
+            <label className="flex items-center justify-end gap-3 rounded-lg border border-border/70 bg-muted/20 px-4 py-3 text-sm">
+              <Checkbox checked={auto} onChange={(event) => setAuto(event.target.checked)} />
+              <span className="font-medium">Automatic Skip Missing Songs</span>
+            </label>
           </div>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
@@ -536,7 +680,7 @@ export default function App() {
           <StatCard label="已确认" value={payload.progress.matched} icon={<Check className="size-4" />} />
           <StatCard label="待处理" value={payload.progress.review} icon={<CircleAlert className="size-4" />} />
           <StatCard label="已跳过" value={payload.progress.skipped} icon={<SkipForward className="size-4" />} />
-          <StatCard label="阶段" value={`Phase ${payload.currentPhase}`} icon={<Sparkles className="size-4" />} />
+          <StatCard label="当前阶段" value={`Phase ${payload.currentPhase}`} icon={<Sparkles className="size-4" />} />
           <div className="xl:col-span-5">
             <div className="mb-2 flex items-center justify-between text-sm text-muted-foreground">
               <span>处理进度</span>
@@ -549,39 +693,60 @@ export default function App() {
         </CardContent>
       </Card>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>阶段进度</CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          {payload.phaseSummary.map((step) => (
+            <div
+              key={step.phase}
+              className="rounded-xl border border-border/70 bg-muted/30 p-4 transition-colors data-[status=running]:border-primary/60 data-[status=done]:border-emerald-500/30 data-[status=error]:border-destructive/40"
+              data-status={step.status}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div
+                    className={`flex size-8 shrink-0 items-center justify-center rounded-full ${
+                      step.status === 'done'
+                        ? 'bg-emerald-500/15 text-emerald-500'
+                        : step.status === 'error'
+                          ? 'bg-destructive/15 text-destructive'
+                          : step.status === 'running'
+                            ? 'bg-primary/15 text-primary'
+                            : 'bg-muted text-muted-foreground'
+                    }`}
+                  >
+                    {step.status === 'done' ? (
+                      <Check className="size-4" />
+                    ) : step.status === 'running' ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : step.status === 'error' ? (
+                      <CircleAlert className="size-4" />
+                    ) : (
+                      <span className="text-xs font-semibold">{step.phase}</span>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium">{step.title}</div>
+                    <div className="text-xs text-muted-foreground">Phase {step.phase}</div>
+                  </div>
+                </div>
+                <Badge variant={step.status === 'done' ? 'success' : step.status === 'error' ? 'destructive' : step.status === 'running' ? 'secondary' : 'outline'}>
+                  {phaseStatusLabel(step.status)}
+                </Badge>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
       <div className="grid gap-6 xl:grid-cols-[1.45fr_0.9fr]">
         <div className="space-y-6">
-          <Card>
-            <CardHeader>
-              <CardTitle>阶段进度</CardTitle>
-              <CardDescription>Phase 1~5 的当前状态和结果摘要。</CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              {payload.phaseSummary.map((step) => (
-                <div
-                  key={step.phase}
-                  className="rounded-xl border border-border/70 bg-muted/30 p-4 transition-colors data-[status=running]:border-primary/60 data-[status=done]:border-emerald-500/30 data-[status=error]:border-destructive/40"
-                  data-status={step.status}
-                >
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <div className="text-sm font-medium">
-                      Phase {step.phase} · {step.title}
-                    </div>
-                    <Badge variant={step.status === 'done' ? 'success' : step.status === 'error' ? 'destructive' : step.status === 'running' ? 'secondary' : 'outline'}>
-                      {step.status}
-                    </Badge>
-                  </div>
-                  <p className="text-sm text-muted-foreground">{step.detail}</p>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-
           {payload.issues.length ? (
             <Card>
               <CardHeader>
                 <CardTitle>问题与提示</CardTitle>
-                <CardDescription>后端返回的结构化错误和警告。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
                 {payload.issues.map((issue) => (
@@ -602,11 +767,6 @@ export default function App() {
           <Card>
             <CardHeader>
               <CardTitle>当前内容</CardTitle>
-              <CardDescription>
-                {payload.currentPhase === 2 && payload.state === 'review_required'
-                  ? '默认展示候选列表，点选即可确认歌曲；找不到就直接跳过。'
-                  : '根据当前阶段展示同步内容和操作。'}
-              </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               {payload.status === 'done' ? (
@@ -650,18 +810,21 @@ export default function App() {
                     </AlertDescription>
                   </Alert>
                   <div className="grid gap-3">
-                    {payload.data.ncmSongs.map((song) => (
-                      <div key={song.id} className="flex items-center gap-4 rounded-xl border border-border/70 bg-muted/20 p-4">
-                        <SongArtwork song={song} />
+                    {payload.data.songMatches.map((song) => (
+                      <div key={song.ncmId} className="flex items-center gap-4 rounded-xl border border-border/70 bg-muted/20 p-4">
+                        <SongArtwork song={{ cover: song.ncmCover, name: song.ncmName }} />
                         <div className="min-w-0 flex-1">
-                          <div className="truncate font-medium">{song.name}</div>
+                          <div className="truncate font-medium">{song.ncmName}</div>
                           <div className="truncate text-sm text-muted-foreground">
-                            {song.artist} · {song.album}
+                            {song.ncmArtist} · {song.ncmAlbum}
                           </div>
                         </div>
-                        <Button variant="ghost" size="icon" onClick={() => window.open(song.ncmUrl, '_blank', 'noopener,noreferrer')}>
-                          <ExternalLink />
-                        </Button>
+                        <div className="flex items-center gap-3">
+                          <SearchStateStatus song={song} />
+                          <Button variant="ghost" size="icon" onClick={() => window.open(song.ncmUrl, '_blank', 'noopener,noreferrer')}>
+                            <ExternalLink />
+                          </Button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -829,7 +992,6 @@ export default function App() {
           <Card>
             <CardHeader>
               <CardTitle>通知</CardTitle>
-              <CardDescription>通知入口保留在同一页面，完成后会回跳到对应会话。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="flex items-center justify-between rounded-xl border border-border/70 bg-muted/30 p-4">
@@ -861,6 +1023,14 @@ export default function App() {
             <CardContent className="space-y-4">
               <div className="rounded-xl border border-border/70 bg-muted/20 p-4">
                 <div className="mb-1 flex items-center gap-2 text-sm text-muted-foreground">
+                  <Music4 className="size-4" />
+                  网易云账户
+                </div>
+                <div className="font-medium">{formatNcmAccount(statusInfo)}</div>
+                {statusInfo?.ncm.refreshed ? <Badge className="mt-3" variant="secondary">已刷新登录态</Badge> : null}
+              </div>
+              <div className="rounded-xl border border-border/70 bg-muted/20 p-4">
+                <div className="mb-1 flex items-center gap-2 text-sm text-muted-foreground">
                   <ShieldCheck className="size-4" />
                   Apple Music 账户
                 </div>
@@ -888,7 +1058,6 @@ export default function App() {
           <Card>
             <CardHeader>
               <CardTitle>操作日志</CardTitle>
-              <CardDescription>页面内的前端操作记录。</CardDescription>
             </CardHeader>
             <CardContent>
               <div className="max-h-[420px] space-y-2 overflow-auto pr-1">
@@ -918,12 +1087,8 @@ export default function App() {
         </div>
       </div>
 
-      <Separator />
-      <div className="flex flex-col gap-3 pb-8 text-sm text-muted-foreground md:flex-row md:items-center md:justify-between">
-        <div>UI 已迁移到 shadcn/ui 风格组件和 lucide-react 图标，Worker 继续负责 API、cron、push 和会话状态。</div>
-        <div>
-          最近更新时间：{new Date(payload.data.updatedAt).toLocaleString('zh-CN')}
-        </div>
+      <div className="pb-8 text-right text-sm text-muted-foreground">
+        最近更新时间：{new Date(payload.data.updatedAt).toLocaleString('zh-CN')}
       </div>
     </div>
   );

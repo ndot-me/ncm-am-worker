@@ -5,6 +5,11 @@ const NCM_DOMAIN = 'https://music.163.com';
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0';
 
+function normalizeCoverUrl(url?: string): string {
+  if (!url) return '';
+  return url.replace(/^http:\/\//, 'https://');
+}
+
 /**
  * Call NCM weapi endpoint
  */
@@ -190,7 +195,7 @@ export async function getDailySongs(
       id: song.al?.id || song.album?.id || 0,
       name: song.al?.name || song.album?.name || '',
     },
-    cover: song.al?.picUrl || song.album?.picUrl || '',
+    cover: normalizeCoverUrl(song.al?.picUrl || song.album?.picUrl || ''),
   }));
   return { songs };
 }
