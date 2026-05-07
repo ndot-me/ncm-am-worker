@@ -3,6 +3,7 @@ import {
   createDeveloperToken,
   searchSongCandidates,
   listPlaylists,
+  validateLibraryAccess,
   createPlaylist,
   addSongsToPlaylist,
   deletePlaylist,
@@ -62,6 +63,16 @@ function getMusicUserToken(env: Env): string {
   throw new Error('Apple Music user token is not configured');
 }
 
+function formatAppleMusicAuthError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('AM API') && message.includes(': 401')) {
+    return new Error(
+      'Apple Music library authorization failed (401). Check AM_USER_TOKEN and AM_DEVELOPER_TOKEN, and make sure they belong to the same Apple Music account/team.',
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
 function createIssue(input: Omit<SyncIssue, 'id' | 'createdAt'>): SyncIssue {
   return {
     id: newSessionId().slice(0, 12),
@@ -107,6 +118,7 @@ function emptySession(id: string, auto: boolean, source: SyncSource, accountLabe
     songMatches: [],
     searchBatchIndex: 0,
     searchBatchSize: BATCH_SIZE,
+    amLibraryValidated: false,
     playlistId: null,
     playlistName: '',
     addedCount: 0,
@@ -541,7 +553,23 @@ export async function phase2(env: Env, session: SyncSession): Promise<SyncSessio
 
   try {
     const developerToken = await getDeveloperToken(env);
+    const userToken = getMusicUserToken(env);
     initializeSongMatches(session);
+
+    if (!session.amLibraryValidated) {
+      try {
+        await validateLibraryAccess(developerToken, userToken);
+        session.amLibraryValidated = true;
+      } catch (error) {
+        return failSession(
+          env,
+          session,
+          2,
+          'am_library_auth_failed',
+          formatAppleMusicAuthError(error).message,
+        );
+      }
+    }
 
     if (session.ncmTotal === 0) {
       session.phase = 3;
@@ -735,7 +763,7 @@ export async function phase3(env: Env, session: SyncSession): Promise<SyncSessio
     await saveSession(env, session);
     return session;
   } catch (error) {
-    return failSession(env, session, 3, 'phase3_failed', (error as Error).message);
+    return failSession(env, session, 3, 'phase3_failed', formatAppleMusicAuthError(error).message);
   }
 }
 
@@ -765,7 +793,7 @@ export async function phase4(env: Env, session: SyncSession): Promise<SyncSessio
     await saveSession(env, session);
     return session;
   } catch (error) {
-    return failSession(env, session, 4, 'phase4_failed', (error as Error).message);
+    return failSession(env, session, 4, 'phase4_failed', formatAppleMusicAuthError(error).message);
   }
 }
 
@@ -800,7 +828,7 @@ export async function phase5(env: Env, session: SyncSession): Promise<SyncSessio
     await clearActiveSessionIfMatches(env, session.id);
     return session;
   } catch (error) {
-    return failSession(env, session, 5, 'phase5_failed', (error as Error).message);
+    return failSession(env, session, 5, 'phase5_failed', formatAppleMusicAuthError(error).message);
   }
 }
 

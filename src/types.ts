@@ -111,6 +111,7 @@ export interface SyncSession {
   songMatches: SongMatch[];
   searchBatchIndex: number;
   searchBatchSize: number;
+  amLibraryValidated: boolean;
 
   playlistId: string | null;
   playlistName: string;

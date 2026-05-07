@@ -1,6 +1,6 @@
 import type { AmCandidate, AmSong } from './types';
 
-const AM_API = 'https://api.music.apple.com/v1';
+const AM_API = 'https://amp-api.music.apple.com/v1';
 const CANDIDATE_LIMIT = 5;
 
 export async function createDeveloperToken(
@@ -58,9 +58,11 @@ async function amFetch(
   const headers: Record<string, string> = {
     Authorization: `Bearer ${developerToken}`,
     'Content-Type': 'application/json',
+    Origin: 'https://music.apple.com',
+    Referer: 'https://music.apple.com/',
   };
   if (userToken) {
-    headers['Music-User-Token'] = userToken;
+    headers['Media-User-Token'] = userToken;
   }
 
   const resp = await fetch(`${AM_API}${path}`, {
@@ -288,6 +290,13 @@ export async function listPlaylists(
   return playlists;
 }
 
+export async function validateLibraryAccess(
+  developerToken: string,
+  userToken: string,
+): Promise<void> {
+  await amFetch('/me/library/playlists?limit=1', developerToken, userToken);
+}
+
 export async function createPlaylist(
   name: string,
   developerToken: string,
@@ -338,7 +347,9 @@ export async function deletePlaylist(
     method: 'DELETE',
     headers: {
       Authorization: `Bearer ${developerToken}`,
-      'Music-User-Token': userToken,
+      'Media-User-Token': userToken,
+      Origin: 'https://music.apple.com',
+      Referer: 'https://music.apple.com/',
     },
   });
 
