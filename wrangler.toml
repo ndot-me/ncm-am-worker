@@ -5,7 +5,7 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 [triggers]
-crons = []  # Sync is now manual via web UI
+crons = ["30 22 * * *"]  # 06:30 UTC+8 daily
 
 # ── KV namespace ──
 # 创建: wrangler kv namespace create NCM_AM

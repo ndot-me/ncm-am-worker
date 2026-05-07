@@ -61,10 +61,59 @@ async function notifySubscribers(env: Env, title: string, body: string, type: 's
   }
 }
 
+// ── Auto sync (runs all phases sequentially) ──
+
+async function runAutoSync(env: Env): Promise<void> {
+  try {
+    const session = await createSession(env, true); // auto=true
+    const s1 = await phase1(env, session);
+    if (s1.status === 'error') {
+      await notifySubscribers(env, '⚠️ 同步失败', `Phase 1: ${s1.errors.join('; ')}`, 'error');
+      return;
+    }
+
+    const s2 = await phase2(env, s1);
+    if (s2.status === 'error') {
+      await notifySubscribers(env, '⚠️ 同步失败', `Phase 2: ${s2.errors.join('; ')}`, 'error');
+      return;
+    }
+
+    // auto=true → phase 2 skips to phase 3 automatically
+    const s3 = await phase3(env, s2);
+    if (s3.status === 'error') {
+      await notifySubscribers(env, '⚠️ 同步失败', `Phase 3: ${s3.errors.join('; ')}`, 'error');
+      return;
+    }
+
+    const s4 = await phase4(env, s3);
+    if (s4.status === 'error') {
+      await notifySubscribers(env, '⚠️ 同步失败', `Phase 4: ${s4.errors.join('; ')}`, 'error');
+      return;
+    }
+
+    const s5 = await phase5(env, s4);
+    const foundCount = s5.amResults.filter(r => r.status === 'found').length;
+    if (s5.status === 'done') {
+      await notifySubscribers(
+        env,
+        '🎵 自动同步完成',
+        `${s5.date}: ${foundCount}/${s5.ncmTotal} 首已同步到 Apple Music`,
+        'success',
+      );
+    } else {
+      await notifySubscribers(env, '⚠️ 同步异常', `错误: ${s5.errors.join('; ')}`, 'error');
+    }
+  } catch (e: any) {
+    console.error('[AutoSync] Fatal error:', e.message);
+    await notifySubscribers(env, '❌ 自动同步失败', e.message, 'error');
+  }
+}
+
 export default {
   // ── Cron trigger (legacy, now just logs — sync is manual via web UI) ──
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
-    console.log(`[${new Date().toISOString()}] Cron triggered — sync is now manual via web UI`);
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    console.log(`[${new Date().toISOString()}] Cron triggered — starting auto sync`);
+    ctx.waitUntil(runAutoSync(env));
   },
 
   // ── HTTP handler ──
