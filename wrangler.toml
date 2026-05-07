@@ -5,7 +5,7 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 [triggers]
-crons = ["10 22 * * *"]  # UTC 22:10 = 北京时间 06:10
+crons = []  # Sync is now manual via web UI
 
 # ── KV namespace ──
 # 创建: wrangler kv namespace create NCM_AM
@@ -13,3 +13,9 @@ crons = ["10 22 * * *"]  # UTC 22:10 = 北京时间 06:10
 [[kv_namespaces]]
 binding = "KV"
 id = "YOUR_KV_ID"
+
+# ── Secrets (set via wrangler secret put) ──
+# NCM_COOKIE    — 网易云 cookie (MUSIC_U=xxx; __csrf=yyy)
+# AM_DEVELOPER_TOKEN — Apple Music JWT
+# AM_USER_TOKEN — Apple Music media-user-token
+# SYNC_TOKEN    — 同步 API 访问令牌 (用于网页鉴权)

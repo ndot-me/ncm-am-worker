@@ -188,8 +188,8 @@ export async function getDailySongs(
       id: song.al?.id || song.album?.id || 0,
       name: song.al?.name || song.album?.name || '',
     },
+    cover: song.al?.picUrl || song.album?.picUrl || '',
   }));
-
   return { songs };
 }
 

@@ -1,12 +1,18 @@
-import type { Env } from './types';
-import { syncPhase1, syncPhase2, formatResult } from './sync';
+import type { Env, SyncSession } from './types';
 import {
-  checkLogin,
-  refreshLoginRaw,
-  qrLoginCreateKey,
-  qrLoginUrl,
-  qrLoginCheck,
-} from './ncm';
+  createSession,
+  getSession,
+  saveSession,
+  phase1,
+  phase2,
+  phase3,
+  phase4,
+  phase5,
+  manualSearch,
+  skipToPhase3,
+} from './sync';
+import { checkLogin, refreshLoginRaw, qrLoginCreateKey, qrLoginUrl, qrLoginCheck } from './ncm';
+import { searchSong } from './apple-music';
 import { generateVapidKeys, sendPushNotification } from './web-push';
 import { SW_JS, subscribeHtml } from './static';
 
@@ -20,99 +26,49 @@ function json(data: unknown, status = 200) {
   return Response.json(data, { status, headers: corsHeaders });
 }
 
-/**
- * Get or create VAPID keys, stored in KV
- */
+// ── Auth middleware ──
+
+function checkToken(url: URL, env: Env): boolean {
+  const token = url.searchParams.get('token');
+  return token === env.SYNC_TOKEN;
+}
+
+// ── Push notification helpers ──
+
 async function getVapidKeys(env: Env): Promise<{ publicKey: string; privateKey: string }> {
   const existing = await env.KV.get('vapid_keys', 'json');
   if (existing) return existing as { publicKey: string; privateKey: string };
-
   const keys = await generateVapidKeys();
   await env.KV.put('vapid_keys', JSON.stringify(keys));
   return keys;
 }
 
-/**
- * Send push to all subscribers
- */
-async function notifySubscribers(
-  env: Env,
-  title: string,
-  body: string,
-  type: 'success' | 'error',
-) {
+async function notifySubscribers(env: Env, title: string, body: string, type: 'success' | 'error') {
   const vapidKeys = await getVapidKeys(env);
   const subsRaw = await env.KV.get('push_subscriptions', 'json');
   const subs: { endpoint: string; keys: { p256dh: string; auth: string } }[] =
     (subsRaw as any[]) || [];
 
-  const payload = JSON.stringify({
-    title,
-    body,
-    type,
-    tag: 'ncm-am-sync',
-    url: '/status',
-  });
-
+  const payload = JSON.stringify({ title, body, type, tag: 'ncm-am-sync', url: '/' });
   const expired: string[] = [];
   for (const sub of subs) {
     const ok = await sendPushNotification(sub, payload, vapidKeys.publicKey, vapidKeys.privateKey);
     if (!ok) expired.push(sub.endpoint);
   }
-
-  // Remove expired subscriptions
   if (expired.length > 0) {
-    const remaining = subs.filter((s) => !expired.includes(s.endpoint));
+    const remaining = subs.filter(s => !expired.includes(s.endpoint));
     await env.KV.put('push_subscriptions', JSON.stringify(remaining));
   }
 }
 
 export default {
-  // ── Cron trigger ──
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`[${new Date().toISOString()}] NCM→AM sync triggered by cron (Phase 1)`);
-    // Phase 1 has no self URL in cron context — use env.SELF_URL or construct from KV
-    // In cron context we can't self-fetch, so run Phase 1 then Phase 2 sequentially
-    const phase1Result = await syncPhase1(env);
-    let result;
-    if (phase1Result.errors.length === 0) {
-      const phase2Result = await syncPhase2(env);
-      // Merge
-      result = { ...phase1Result };
-      result.playlistId = phase2Result.playlistId;
-      result.deletedPlaylists = phase2Result.deletedPlaylists;
-      if (phase2Result.errors.length > 0) {
-        result.errors.push(...phase2Result.errors);
-      }
-    } else {
-      result = phase1Result;
-    }
-    const text = formatResult(result);
-    console.log(text);
-
-    await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
-    await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });
-
-    // Push notification
-    if (result.errors.length === 0 && result.found > 0) {
-      await notifySubscribers(
-        env,
-        '🎵 同步完成',
-        `${result.date}: ${result.found}/${result.total} 首已同步`,
-        'success',
-      );
-    } else {
-      await notifySubscribers(
-        env,
-        '⚠️ 同步异常',
-        `${result.date}: ${result.found}/${result.total} 首, ${result.errors.length} 个错误`,
-        'error',
-      );
-    }
+  // ── Cron trigger (legacy, now just logs — sync is manual via web UI) ──
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    console.log(`[${new Date().toISOString()}] Cron triggered — sync is now manual via web UI`);
   },
 
   // ── HTTP handler ──
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -120,24 +76,22 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // ── GET / ──
-    if (path === '/' && request.method === 'GET') {
-      return json({
-        service: 'ncm-am-worker',
-        endpoints: {
-          'GET  /':            '本页',
-          'GET  /status':      'NCM 登录状态 + 最近同步结果',
-          'GET  /sync':        '手动触发同步 (Phase 1 + Phase 2)',
-          'GET  /login':       '获取 QR 登录 URL',
-          'GET  /login/check': '轮询 QR 扫码状态',
-          'GET  /subscribe':   '订阅推送通知页面',
-          'POST /subscribe':   '保存推送订阅',
-          'GET  /vapid-key':   '获取 VAPID 公钥',
-        },
+    // ── Serve frontend ──
+    if (path === '/' || path === '/index.html') {
+      const { frontendHtml } = await import('./static');
+      return new Response(frontendHtml(), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
       });
     }
 
-    // ── GET /subscribe ── (serve HTML page)
+    // ── Service worker ──
+    if (path === '/sw.js') {
+      return new Response(SW_JS, {
+        headers: { 'Content-Type': 'application/javascript', ...corsHeaders },
+      });
+    }
+
+    // ── Subscribe page (legacy) ──
     if (path === '/subscribe' && request.method === 'GET') {
       const vapidKeys = await getVapidKeys(env);
       return new Response(subscribeHtml(vapidKeys.publicKey), {
@@ -145,34 +99,22 @@ export default {
       });
     }
 
-    // ── GET /sw.js ── (service worker)
-    if (path === '/sw.js') {
-      return new Response(SW_JS, {
-        headers: { 'Content-Type': 'application/javascript', ...corsHeaders },
-      });
-    }
-
-    // ── GET /vapid-key ──
+    // ── VAPID public key ──
     if (path === '/vapid-key' && request.method === 'GET') {
       const keys = await getVapidKeys(env);
       return json({ publicKey: keys.publicKey });
     }
 
-    // ── POST /subscribe ── (save push subscription)
+    // ── Push subscribe ──
     if (path === '/subscribe' && request.method === 'POST') {
       try {
         const sub = await request.json() as any;
         if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) {
           return json({ error: 'Invalid subscription' }, 400);
         }
-
-        // Get existing subscriptions
         const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
-
-        // Deduplicate by endpoint
-        const filtered = existing.filter((s) => s.endpoint !== sub.endpoint);
+        const filtered = existing.filter(s => s.endpoint !== sub.endpoint);
         filtered.push({ endpoint: sub.endpoint, keys: sub.keys });
-
         await env.KV.put('push_subscriptions', JSON.stringify(filtered));
         return json({ ok: true, count: filtered.length });
       } catch (e: any) {
@@ -180,12 +122,12 @@ export default {
       }
     }
 
-    // ── DELETE /subscribe ── (unsubscribe)
+    // ── Push unsubscribe ──
     if (path === '/subscribe' && request.method === 'DELETE') {
       try {
         const { endpoint } = await request.json() as any;
         const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
-        const filtered = existing.filter((s) => s.endpoint !== endpoint);
+        const filtered = existing.filter(s => s.endpoint !== endpoint);
         await env.KV.put('push_subscriptions', JSON.stringify(filtered));
         return json({ ok: true, count: filtered.length });
       } catch (e: any) {
@@ -193,10 +135,10 @@ export default {
       }
     }
 
-    // ── GET /status ──
+    // ── Login status ──
     if (path === '/status' && request.method === 'GET') {
       let cookie = env.NCM_COOKIE;
-      let savedCookie = await env.KV.get('ncm_cookie');
+      const savedCookie = await env.KV.get('ncm_cookie');
       if (savedCookie) cookie = savedCookie;
 
       let ncmStatus: { ok: boolean; uid?: string; nickname?: string; error?: string };
@@ -219,113 +161,149 @@ export default {
         }
       }
 
-      const lastSync = await env.KV.get('last_sync_text');
-      const subs: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
-
       return json({
-        ncm: {
-          ...ncmStatus,
-          refreshed,
-          message: ncmStatus.ok
-            ? `✅ 登录正常 (${ncmStatus.nickname || ncmStatus.uid})`
-            : `❌ 登录已过期，请访问 /login 重新扫码`,
-        },
-        push: { subscribers: subs.length },
-        lastSync: lastSync || null,
+        ncm: { ...ncmStatus, refreshed },
+        push: { subscribers: ((await env.KV.get('push_subscriptions', 'json')) as any[] || []).length },
       });
     }
 
-    // ── GET /login ──
+    // ── QR Login ──
     if (path === '/login' && request.method === 'GET') {
       try {
         const key = await qrLoginCreateKey();
         const qrUrl = qrLoginUrl(key);
         await env.KV.put(`qr_key:${key}`, 'pending', { expirationTtl: 300 });
-
-        return json({
-          ok: true,
-          key,
-          qrUrl,
-          instructions: [
-            '1. 用网易云音乐 App 扫描 qrUrl 中的二维码',
-            '2. 在 App 中确认登录',
-            `3. 访问 GET /login/check?key=${key} 查看状态`,
-            '4. 状态变为 803 表示成功，cookie 自动保存',
-          ],
-        });
+        return json({ ok: true, key, qrUrl });
       } catch (e: any) {
         return json({ ok: false, error: e.message }, 500);
       }
     }
 
-    // ── GET /login/check?key=xxx ──
     if (path === '/login/check' && request.method === 'GET') {
       const key = url.searchParams.get('key');
-      if (!key) return json({ error: 'Missing ?key= parameter' }, 400);
-
+      if (!key) return json({ error: 'Missing ?key=' }, 400);
       try {
         const result = await qrLoginCheck(key);
-
         if (result.code === 803 && result.cookie) {
           await env.KV.put('ncm_cookie', result.cookie, { expirationTtl: 86400 * 60 });
           await env.KV.delete(`qr_key:${key}`);
-
-          const status = await checkLogin(result.cookie);
-          return json({
-            code: 803,
-            status: 'success',
-            message: '✅ 登录成功，cookie 已保存',
-            user: status.ok ? { uid: status.uid, nickname: status.nickname } : null,
-          });
+          return json({ code: 803, status: 'success', message: '✅ 登录成功' });
         }
-
-        const statusMap: Record<number, string> = {
-          800: '❌ 二维码已过期，请重新访问 /login',
-          801: '⏳ 等待扫码...',
-          802: '⏳ 已扫码，等待确认...',
-        };
-
-        return json({
-          code: result.code,
-          status: statusMap[result.code] || `未知状态: ${result.code}`,
-          message: result.message,
-        });
+        return json({ code: result.code, message: result.message });
       } catch (e: any) {
-        return json({ ok: false, error: e.message }, 500);
+        return json({ error: e.message }, 500);
       }
     }
 
-    // ── GET/POST /sync ──
-    if (path === '/sync') {
-      const phase = url.searchParams.get('phase');
+    // ══════════════════════════════════════════════
+    // ── Sync API (token required) ──
+    // ══════════════════════════════════════════════
 
-      // Phase 2 only (called by Phase 1 internally)
-      if (phase === '2') {
+    if (path === '/sync') {
+      // All /sync endpoints require token
+      if (!checkToken(url, env)) {
+        return json({ error: 'Unauthorized — provide ?token=xxx' }, 401);
+      }
+
+      const phase = url.searchParams.get('phase');
+      const sessionId = url.searchParams.get('session');
+      const auto = url.searchParams.get('auto') === '1';
+
+      // ── POST /sync?token=xxx&auto=1 → Start new session (Phase 1) ──
+      if (!phase && request.method === 'GET') {
         try {
-          const result = await syncPhase2(env);
+          const session = await createSession(env, auto);
+          const result = await phase1(env, session);
           return json(result);
         } catch (e: any) {
           return json({ error: e.message }, 500);
         }
       }
 
-      // Phase 1 + Phase 2 (full sync)
-      try {
-        // Build self URL for Phase 1 to call Phase 2
-        const selfUrl = `${url.protocol}//${url.host}`;
-        const result = await syncPhase1(env, selfUrl);
-        const text = formatResult(result);
-        await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
-        await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });
+      // ── Session required for phases 2-5 ──
+      if (phase && !sessionId) {
+        return json({ error: 'Missing ?session=xxx' }, 400);
+      }
 
-        // Push notification
-        if (result.errors.length === 0 && result.found > 0) {
-          await notifySubscribers(env, '🎵 同步完成', `${result.date}: ${result.found}/${result.total} 首`, 'success');
-        } else {
-          await notifySubscribers(env, '⚠️ 同步异常', `${result.date}: ${result.found}/${result.total}, ${result.errors.length} 错误`, 'error');
+      if (phase && sessionId) {
+        const session = await getSession(env, sessionId);
+        if (!session) {
+          return json({ error: 'Session not found or expired' }, 404);
         }
 
-        return json(result);
+        try {
+          let result: SyncSession;
+
+          switch (phase) {
+            case '2':
+              result = await phase2(env, session);
+              break;
+
+            case '2.5': {
+              // Manual search: ?ncmId=xxx&query=yyy
+              const ncmId = parseInt(url.searchParams.get('ncmId') || '0', 10);
+              const query = url.searchParams.get('query') || '';
+              if (!ncmId || !query) {
+                return json({ error: 'Missing ?ncmId= or ?query=' }, 400);
+              }
+              result = await manualSearch(env, session, ncmId, query);
+              break;
+            }
+
+            case '2-skip':
+              result = await skipToPhase3(env, session);
+              break;
+
+            case '3':
+              result = await phase3(env, session);
+              break;
+
+            case '4':
+              result = await phase4(env, session);
+              break;
+
+            case '5':
+              result = await phase5(env, session);
+              // Send push notification
+              if (result.status === 'done') {
+                const foundCount = result.amResults.filter(r => r.status === 'found').length;
+                await notifySubscribers(
+                  env,
+                  '🎵 同步完成',
+                  `${result.date}: ${foundCount}/${result.ncmTotal} 首已同步到 Apple Music`,
+                  'success',
+                );
+              } else {
+                await notifySubscribers(env, '⚠️ 同步异常', `错误: ${result.errors.join('; ')}`, 'error');
+              }
+              break;
+
+            default:
+              return json({ error: `Unknown phase: ${phase}` }, 400);
+          }
+
+          return json(result);
+        } catch (e: any) {
+          return json({ error: e.message }, 500);
+        }
+      }
+
+      return json({ error: 'Invalid request' }, 400);
+    }
+
+    // ── AM search (for manual song matching) ──
+    if (path === '/search') {
+      if (!checkToken(url, env)) {
+        return json({ error: 'Unauthorized' }, 401);
+      }
+      const q = url.searchParams.get('q');
+      if (!q) return json({ error: 'Missing ?q=' }, 400);
+
+      try {
+        const storefront = env.STOREFRONT || 'jp';
+        const developerToken = env.AM_DEVELOPER_TOKEN || '';
+        const match = await searchSong(q, '', storefront, developerToken);
+        return json({ match });
       } catch (e: any) {
         return json({ error: e.message }, 500);
       }
