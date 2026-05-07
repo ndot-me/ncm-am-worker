@@ -30,10 +30,10 @@ export async function generateVapidKeys(): Promise<{
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
     ['sign', 'verify'],
-  );
+  ) as CryptoKeyPair;
 
-  const pubRaw = await crypto.subtle.exportKey('raw', keyPair.publicKey);
-  const privJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+  const pubRaw = await crypto.subtle.exportKey('raw', keyPair.publicKey) as ArrayBuffer;
+  const privJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey) as JsonWebKey;
 
   return {
     publicKey: uint8ArrayToUrlBase64(new Uint8Array(pubRaw)),
@@ -114,7 +114,7 @@ async function encryptPayload(
     { name: 'ECDH', namedCurve: 'P-256' },
     true,
     ['deriveBits'],
-  );
+  ) as CryptoKeyPair;
 
   // Import client's public key
   const clientPubKey = await crypto.subtle.importKey(
@@ -127,14 +127,14 @@ async function encryptPayload(
 
   // Derive shared secret
   const sharedSecret = await crypto.subtle.deriveBits(
-    { name: 'ECDH', public: clientPubKey },
+    { name: 'ECDH', public: clientPubKey } as { name: string; public: CryptoKey },
     localKeyPair.privateKey,
     256,
   );
 
   // Export local public key
   const localPubKeyRaw = new Uint8Array(
-    await crypto.subtle.exportKey('raw', localKeyPair.publicKey),
+    await crypto.subtle.exportKey('raw', localKeyPair.publicKey) as ArrayBuffer,
   );
 
   // HKDF to derive PRK
@@ -237,8 +237,9 @@ export async function sendPushNotification(
     };
 
     let body: Uint8Array | null = null;
-    if (subscription.keys && payload) {
-      const encrypted = await encryptPayload(subscription, payload);
+    const keys = subscription.keys;
+    if (keys && payload) {
+      const encrypted = await encryptPayload({ endpoint: subscription.endpoint, keys }, payload);
       body = encrypted.body;
       headers['Content-Encoding'] = encrypted.contentEncoding;
       headers['Content-Type'] = 'application/octet-stream';

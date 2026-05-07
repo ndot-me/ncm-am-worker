@@ -1,20 +1,23 @@
 import type { Env, SyncSession } from './types';
 import {
-  createSession,
-  getSession,
-  saveSession,
+  startManualSession,
+  startCronSession,
+  getSessionResponse,
+  getMutableSession,
   phase1,
   phase2,
+  searchPhase2Candidates,
+  selectPhase2Candidate,
+  skipPhase2Song,
+  continuePhase2,
   phase3,
   phase4,
   phase5,
-  manualSearch,
-  skipToPhase3,
 } from './sync';
 import { checkLogin, refreshLoginRaw, qrLoginCreateKey, qrLoginUrl, qrLoginCheck } from './ncm';
-import { searchSong } from './apple-music';
+import { searchSongCandidates } from './apple-music';
 import { generateVapidKeys, sendPushNotification } from './web-push';
-import { SW_JS, subscribeHtml } from './static';
+import { SW_JS, frontendHtml, subscribeHtml } from './static';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -22,18 +25,35 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
-function json(data: unknown, status = 200) {
+function json(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: corsHeaders });
 }
 
-// ── Auth middleware ──
-
 function checkToken(url: URL, env: Env): boolean {
-  const token = url.searchParams.get('token');
-  return token === env.SYNC_TOKEN;
+  return url.searchParams.get('token') === env.SYNC_TOKEN;
 }
 
-// ── Push notification helpers ──
+function getErrorStatus(message: string): number {
+  if (message.includes('Missing ?')) {
+    return 400;
+  }
+  if (
+    message.includes('not found') ||
+    message.includes('Candidate not found')
+  ) {
+    return 404;
+  }
+  if (
+    message.includes('Unauthorized') ||
+    message.includes('Review phase is incomplete') ||
+    message.includes('no longer the active session') ||
+    message.includes('replaced') ||
+    message.includes('not active')
+  ) {
+    return 409;
+  }
+  return 500;
+}
 
 async function getVapidKeys(env: Env): Promise<{ publicKey: string; privateKey: string }> {
   const existing = await env.KV.get('vapid_keys', 'json');
@@ -43,80 +63,114 @@ async function getVapidKeys(env: Env): Promise<{ publicKey: string; privateKey: 
   return keys;
 }
 
-async function notifySubscribers(env: Env, title: string, body: string, type: 'success' | 'error') {
+async function notifySubscribers(
+  env: Env,
+  title: string,
+  body: string,
+  type: 'success' | 'error',
+  sessionId?: string,
+): Promise<void> {
   const vapidKeys = await getVapidKeys(env);
   const subsRaw = await env.KV.get('push_subscriptions', 'json');
-  const subs: { endpoint: string; keys: { p256dh: string; auth: string } }[] =
+  const subscriptions: { endpoint: string; keys: { p256dh: string; auth: string } }[] =
     (subsRaw as any[]) || [];
 
-  const payload = JSON.stringify({ title, body, type, tag: 'ncm-am-sync', url: '/' });
+  const payload = JSON.stringify({
+    title,
+    body,
+    type,
+    tag: 'ncm-am-sync',
+    url: sessionId ? `/?session=${encodeURIComponent(sessionId)}` : '/',
+  });
+
   const expired: string[] = [];
-  for (const sub of subs) {
+  for (const sub of subscriptions) {
     const ok = await sendPushNotification(sub, payload, vapidKeys.publicKey, vapidKeys.privateKey);
     if (!ok) expired.push(sub.endpoint);
   }
+
   if (expired.length > 0) {
-    const remaining = subs.filter(s => !expired.includes(s.endpoint));
+    const remaining = subscriptions.filter((sub) => !expired.includes(sub.endpoint));
     await env.KV.put('push_subscriptions', JSON.stringify(remaining));
   }
 }
 
-// ── Auto sync (runs all phases sequentially) ──
+function summarizeSession(session: SyncSession): { found: number; total: number } {
+  const found = session.songMatches.filter((song) => song.status === 'matched').length;
+  return { found, total: session.ncmTotal };
+}
 
 async function runAutoSync(env: Env): Promise<void> {
+  const session = await startCronSession(env);
+  if (!session) {
+    console.log(`[${new Date().toISOString()}] Cron skipped because an active session already exists`);
+    return;
+  }
+
   try {
-    const session = await createSession(env, true); // auto=true
     const s1 = await phase1(env, session);
-    if (s1.status === 'error') {
-      await notifySubscribers(env, '⚠️ 同步失败', `Phase 1: ${s1.errors.join('; ')}`, 'error');
+    if (s1.status !== 'running') {
+      await notifySubscribers(env, '⚠️ 自动同步失败', s1.issues.at(-1)?.message || 'Phase 1 failed', 'error', s1.id);
       return;
     }
 
     const s2 = await phase2(env, s1);
-    if (s2.status === 'error') {
-      await notifySubscribers(env, '⚠️ 同步失败', `Phase 2: ${s2.errors.join('; ')}`, 'error');
+    if (s2.status !== 'running') {
+      await notifySubscribers(env, '⚠️ 自动同步失败', s2.issues.at(-1)?.message || 'Phase 2 failed', 'error', s2.id);
       return;
     }
 
-    // auto=true → phase 2 skips to phase 3 automatically
     const s3 = await phase3(env, s2);
-    if (s3.status === 'error') {
-      await notifySubscribers(env, '⚠️ 同步失败', `Phase 3: ${s3.errors.join('; ')}`, 'error');
+    if (s3.status !== 'running') {
+      await notifySubscribers(env, '⚠️ 自动同步失败', s3.issues.at(-1)?.message || 'Phase 3 failed', 'error', s3.id);
       return;
     }
 
     const s4 = await phase4(env, s3);
-    if (s4.status === 'error') {
-      await notifySubscribers(env, '⚠️ 同步失败', `Phase 4: ${s4.errors.join('; ')}`, 'error');
+    if (s4.status !== 'running') {
+      await notifySubscribers(env, '⚠️ 自动同步失败', s4.issues.at(-1)?.message || 'Phase 4 failed', 'error', s4.id);
       return;
     }
 
     const s5 = await phase5(env, s4);
-    const foundCount = s5.amResults.filter(r => r.status === 'found').length;
+    const summary = summarizeSession(s5);
     if (s5.status === 'done') {
       await notifySubscribers(
         env,
         '🎵 自动同步完成',
-        `${s5.date}: ${foundCount}/${s5.ncmTotal} 首已同步到 Apple Music`,
+        `${s5.date}: ${summary.found}/${summary.total} 首已同步到 Apple Music`,
         'success',
+        s5.id,
       );
     } else {
-      await notifySubscribers(env, '⚠️ 同步异常', `错误: ${s5.errors.join('; ')}`, 'error');
+      await notifySubscribers(
+        env,
+        '⚠️ 自动同步异常',
+        s5.issues.at(-1)?.message || 'Unknown sync error',
+        'error',
+        s5.id,
+      );
     }
-  } catch (e: any) {
-    console.error('[AutoSync] Fatal error:', e.message);
-    await notifySubscribers(env, '❌ 自动同步失败', e.message, 'error');
+  } catch (error) {
+    console.error('[AutoSync] Fatal error:', (error as Error).message);
+    await notifySubscribers(env, '❌ 自动同步失败', (error as Error).message, 'error', session.id);
   }
 }
 
+async function getDeveloperToken(env: Env): Promise<string> {
+  if (env.AM_DEVELOPER_TOKEN) return env.AM_DEVELOPER_TOKEN;
+  if (!env.AM_TEAM_ID || !env.AM_KEY_ID || !env.AM_PRIVATE_KEY) {
+    throw new Error('Apple Music developer token is not configured');
+  }
+  const { createDeveloperToken } = await import('./apple-music');
+  return createDeveloperToken(env.AM_TEAM_ID, env.AM_KEY_ID, env.AM_PRIVATE_KEY);
+}
+
 export default {
-  // ── Cron trigger (legacy, now just logs — sync is manual via web UI) ──
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`[${new Date().toISOString()}] Cron triggered — starting auto sync`);
     ctx.waitUntil(runAutoSync(env));
   },
 
-  // ── HTTP handler ──
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -125,22 +179,18 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // ── Serve frontend ──
     if (path === '/' || path === '/index.html') {
-      const { frontendHtml } = await import('./static');
       return new Response(frontendHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
       });
     }
 
-    // ── Service worker ──
     if (path === '/sw.js') {
       return new Response(SW_JS, {
         headers: { 'Content-Type': 'application/javascript', ...corsHeaders },
       });
     }
 
-    // ── Subscribe page (legacy) ──
     if (path === '/subscribe' && request.method === 'GET') {
       const vapidKeys = await getVapidKeys(env);
       return new Response(subscribeHtml(vapidKeys.publicKey), {
@@ -148,89 +198,85 @@ export default {
       });
     }
 
-    // ── VAPID public key ──
     if (path === '/vapid-key' && request.method === 'GET') {
       const keys = await getVapidKeys(env);
       return json({ publicKey: keys.publicKey });
     }
 
-    // ── Push subscribe ──
     if (path === '/subscribe' && request.method === 'POST') {
       try {
-        const sub = await request.json() as any;
+        const sub = (await request.json()) as any;
         if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) {
           return json({ error: 'Invalid subscription' }, 400);
         }
         const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
-        const filtered = existing.filter(s => s.endpoint !== sub.endpoint);
+        const filtered = existing.filter((item) => item.endpoint !== sub.endpoint);
         filtered.push({ endpoint: sub.endpoint, keys: sub.keys });
         await env.KV.put('push_subscriptions', JSON.stringify(filtered));
         return json({ ok: true, count: filtered.length });
-      } catch (e: any) {
-        return json({ error: e.message }, 500);
+      } catch (error) {
+        return json({ error: (error as Error).message }, 500);
       }
     }
 
-    // ── Push unsubscribe ──
     if (path === '/subscribe' && request.method === 'DELETE') {
       try {
-        const { endpoint } = await request.json() as any;
+        const { endpoint } = (await request.json()) as any;
         const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
-        const filtered = existing.filter(s => s.endpoint !== endpoint);
+        const filtered = existing.filter((item) => item.endpoint !== endpoint);
         await env.KV.put('push_subscriptions', JSON.stringify(filtered));
         return json({ ok: true, count: filtered.length });
-      } catch (e: any) {
-        return json({ error: e.message }, 500);
+      } catch (error) {
+        return json({ error: (error as Error).message }, 500);
       }
     }
 
-    // ── Login status ──
     if (path === '/status' && request.method === 'GET') {
       let cookie = env.NCM_COOKIE;
       const savedCookie = await env.KV.get('ncm_cookie');
       if (savedCookie) cookie = savedCookie;
 
-      let ncmStatus: { ok: boolean; uid?: string; nickname?: string; error?: string };
+      let ncm: { ok: boolean; uid?: string; nickname?: string; error?: string };
       try {
-        ncmStatus = await checkLogin(cookie);
-      } catch (e: any) {
-        ncmStatus = { ok: false, error: e.message };
+        ncm = await checkLogin(cookie);
+      } catch (error) {
+        ncm = { ok: false, error: (error as Error).message };
       }
 
       let refreshed = false;
-      if (!ncmStatus.ok) {
-        const newCookie = await refreshLoginRaw(cookie);
-        if (newCookie) {
-          const recheck = await checkLogin(newCookie);
+      if (!ncm.ok) {
+        const refreshedCookie = await refreshLoginRaw(cookie);
+        if (refreshedCookie) {
+          const recheck = await checkLogin(refreshedCookie);
           if (recheck.ok) {
-            await env.KV.put('ncm_cookie', newCookie, { expirationTtl: 86400 * 60 });
-            ncmStatus = recheck;
             refreshed = true;
+            ncm = recheck;
+            await env.KV.put('ncm_cookie', refreshedCookie, { expirationTtl: 86400 * 60 });
           }
         }
       }
 
       return json({
-        ncm: { ...ncmStatus, refreshed },
-        push: { subscribers: ((await env.KV.get('push_subscriptions', 'json')) as any[] || []).length },
+        ncm: { ...ncm, refreshed },
+        push: { subscribers: (((await env.KV.get('push_subscriptions', 'json')) as any[]) || []).length },
+        activeSession: await getSessionResponse(env),
       });
     }
 
-    // ── QR Login ──
     if (path === '/login' && request.method === 'GET') {
       try {
         const key = await qrLoginCreateKey();
-        const qrUrl = qrLoginUrl(key);
         await env.KV.put(`qr_key:${key}`, 'pending', { expirationTtl: 300 });
-        return json({ ok: true, key, qrUrl });
-      } catch (e: any) {
-        return json({ ok: false, error: e.message }, 500);
+        return json({ ok: true, key, qrUrl: qrLoginUrl(key) });
+      } catch (error) {
+        return json({ error: (error as Error).message }, 500);
       }
     }
 
     if (path === '/login/check' && request.method === 'GET') {
       const key = url.searchParams.get('key');
       if (!key) return json({ error: 'Missing ?key=' }, 400);
+
       try {
         const result = await qrLoginCheck(key);
         if (result.code === 803 && result.cookie) {
@@ -239,17 +285,45 @@ export default {
           return json({ code: 803, status: 'success', message: '✅ 登录成功' });
         }
         return json({ code: result.code, message: result.message });
-      } catch (e: any) {
-        return json({ error: e.message }, 500);
+      } catch (error) {
+        return json({ error: (error as Error).message }, 500);
       }
     }
 
-    // ══════════════════════════════════════════════
-    // ── Sync API (token required) ──
-    // ══════════════════════════════════════════════
+    if (path === '/session' && request.method === 'GET') {
+      if (!checkToken(url, env)) {
+        return json({ error: 'Unauthorized — provide ?token=xxx' }, 401);
+      }
+      const sessionId = url.searchParams.get('session') || undefined;
+      const response = await getSessionResponse(env, sessionId);
+      if (!response) {
+        return json({ error: 'Session not found' }, 404);
+      }
+      return json(response);
+    }
+
+    if (path === '/search' && request.method === 'GET') {
+      if (!checkToken(url, env)) {
+        return json({ error: 'Unauthorized — provide ?token=xxx' }, 401);
+      }
+      const query = url.searchParams.get('q');
+      const songName = url.searchParams.get('song') || query || '';
+      const artist = url.searchParams.get('artist') || '';
+      if (!query && !songName) {
+        return json({ error: 'Missing ?q=' }, 400);
+      }
+
+      try {
+        const developerToken = await getDeveloperToken(env);
+        const storefront = env.STOREFRONT || 'jp';
+        const candidates = await searchSongCandidates(songName, artist, storefront, developerToken, query || undefined);
+        return json({ query, storefront, candidates });
+      } catch (error) {
+        return json({ error: (error as Error).message }, 500);
+      }
+    }
 
     if (path === '/sync') {
-      // All /sync endpoints require token
       if (!checkToken(url, env)) {
         return json({ error: 'Unauthorized — provide ?token=xxx' }, 401);
       }
@@ -258,103 +332,91 @@ export default {
       const sessionId = url.searchParams.get('session');
       const auto = url.searchParams.get('auto') === '1';
 
-      // ── POST /sync?token=xxx&auto=1 → Start new session (Phase 1) ──
-      if (!phase && request.method === 'GET') {
-        try {
-          const session = await createSession(env, auto);
-          const result = await phase1(env, session);
-          return json(result);
-        } catch (e: any) {
-          return json({ error: e.message }, 500);
-        }
-      }
-
-      // ── Session required for phases 2-5 ──
-      if (phase && !sessionId) {
-        return json({ error: 'Missing ?session=xxx' }, 400);
-      }
-
-      if (phase && sessionId) {
-        const session = await getSession(env, sessionId);
-        if (!session) {
-          return json({ error: 'Session not found or expired' }, 404);
-        }
-
-        try {
-          let result: SyncSession;
-
-          switch (phase) {
-            case '2':
-              result = await phase2(env, session);
-              break;
-
-            case '2.5': {
-              // Manual search: ?ncmId=xxx&query=yyy
-              const ncmId = parseInt(url.searchParams.get('ncmId') || '0', 10);
-              const query = url.searchParams.get('query') || '';
-              if (!ncmId || !query) {
-                return json({ error: 'Missing ?ncmId= or ?query=' }, 400);
-              }
-              result = await manualSearch(env, session, ncmId, query);
-              break;
-            }
-
-            case '2-skip':
-              result = await skipToPhase3(env, session);
-              break;
-
-            case '3':
-              result = await phase3(env, session);
-              break;
-
-            case '4':
-              result = await phase4(env, session);
-              break;
-
-            case '5':
-              result = await phase5(env, session);
-              // Send push notification
-              if (result.status === 'done') {
-                const foundCount = result.amResults.filter(r => r.status === 'found').length;
-                await notifySubscribers(
-                  env,
-                  '🎵 同步完成',
-                  `${result.date}: ${foundCount}/${result.ncmTotal} 首已同步到 Apple Music`,
-                  'success',
-                );
-              } else {
-                await notifySubscribers(env, '⚠️ 同步异常', `错误: ${result.errors.join('; ')}`, 'error');
-              }
-              break;
-
-            default:
-              return json({ error: `Unknown phase: ${phase}` }, 400);
-          }
-
-          return json(result);
-        } catch (e: any) {
-          return json({ error: e.message }, 500);
-        }
-      }
-
-      return json({ error: 'Invalid request' }, 400);
-    }
-
-    // ── AM search (for manual song matching) ──
-    if (path === '/search') {
-      if (!checkToken(url, env)) {
-        return json({ error: 'Unauthorized' }, 401);
-      }
-      const q = url.searchParams.get('q');
-      if (!q) return json({ error: 'Missing ?q=' }, 400);
-
       try {
-        const storefront = env.STOREFRONT || 'jp';
-        const developerToken = env.AM_DEVELOPER_TOKEN || '';
-        const match = await searchSong(q, '', storefront, developerToken);
-        return json({ match });
-      } catch (e: any) {
-        return json({ error: e.message }, 500);
+        if (!phase) {
+          const session = await startManualSession(env, auto);
+          const result = await phase1(env, session);
+          return json(await getSessionResponse(env, result.id));
+        }
+
+        if (!sessionId) {
+          return json({ error: 'Missing ?session=xxx' }, 400);
+        }
+
+        const session = await getMutableSession(env, sessionId);
+        let updated: SyncSession;
+
+        switch (phase) {
+          case '2':
+            updated = await phase2(env, session);
+            break;
+          case '2-search': {
+            const ncmId = parseInt(url.searchParams.get('ncmId') || '0', 10);
+            const query = url.searchParams.get('query') || '';
+            if (!ncmId || !query.trim()) {
+              return json({ error: 'Missing ?ncmId= or ?query=' }, 400);
+            }
+            updated = await searchPhase2Candidates(env, session, ncmId, query);
+            break;
+          }
+          case '2-select': {
+            const ncmId = parseInt(url.searchParams.get('ncmId') || '0', 10);
+            const candidateId = url.searchParams.get('candidateId') || '';
+            if (!ncmId || !candidateId) {
+              return json({ error: 'Missing ?ncmId= or ?candidateId=' }, 400);
+            }
+            updated = await selectPhase2Candidate(env, session, ncmId, candidateId);
+            break;
+          }
+          case '2-skip-song': {
+            const ncmId = parseInt(url.searchParams.get('ncmId') || '0', 10);
+            if (!ncmId) {
+              return json({ error: 'Missing ?ncmId=' }, 400);
+            }
+            updated = await skipPhase2Song(env, session, ncmId);
+            break;
+          }
+          case '2-continue':
+            updated = await continuePhase2(env, session);
+            break;
+          case '3':
+            updated = await phase3(env, session);
+            break;
+          case '4':
+            updated = await phase4(env, session);
+            break;
+          case '5':
+            updated = await phase5(env, session);
+            break;
+          default:
+            return json({ error: `Unknown phase: ${phase}` }, 400);
+        }
+
+        if (phase === '5') {
+          const summary = summarizeSession(updated);
+          if (updated.status === 'done') {
+            await notifySubscribers(
+              env,
+              '🎵 同步完成',
+              `${updated.date}: ${summary.found}/${summary.total} 首已同步到 Apple Music`,
+              'success',
+              updated.id,
+            );
+          } else if (updated.status === 'error') {
+            await notifySubscribers(
+              env,
+              '⚠️ 同步异常',
+              updated.issues.at(-1)?.message || 'Unknown sync error',
+              'error',
+              updated.id,
+            );
+          }
+        }
+
+        return json(await getSessionResponse(env, updated.id));
+      } catch (error) {
+        const message = (error as Error).message;
+        return json({ error: message }, getErrorStatus(message));
       }
     }
 

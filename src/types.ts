@@ -1,20 +1,18 @@
 export interface Env {
-  // KV (single namespace)
   KV: KVNamespace;
 
-  // Secrets (set via wrangler secret)
-  NCM_COOKIE: string;             // MUSIC_U=xxx; __csrf=yyy (initial, auto-refreshed)
-  AM_DEVELOPER_TOKEN?: string;    // Apple Music JWT (if pre-existing)
-  AM_USER_TOKEN: string;          // media-user-token from cookie
-  AM_TEAM_ID?: string;            // Apple Developer Team ID (if generating token)
-  AM_KEY_ID?: string;             // MusicKit Key ID (if generating token)
-  AM_PRIVATE_KEY?: string;        // MusicKit private key PEM (if generating token)
-  SYNC_TOKEN: string;             // Bearer token for sync API auth
+  NCM_COOKIE: string;
+  AM_DEVELOPER_TOKEN?: string;
+  AM_USER_TOKEN: string;
+  AM_ACCOUNT_LABEL?: string;
+  AM_TEAM_ID?: string;
+  AM_KEY_ID?: string;
+  AM_PRIVATE_KEY?: string;
+  SYNC_TOKEN: string;
 
-  // Optional
-  PLAYLIST_PREFIX?: string;       // default "NCM Daily "
-  KEEP_DAYS?: string;             // default "3"
-  STOREFRONT?: string;            // default "jp"
+  PLAYLIST_PREFIX?: string;
+  KEEP_DAYS?: string;
+  STOREFRONT?: string;
 }
 
 export interface NcmSong {
@@ -25,6 +23,15 @@ export interface NcmSong {
   cover: string;
 }
 
+export interface NcmSongDisplay {
+  id: number;
+  name: string;
+  artist: string;
+  album: string;
+  cover: string;
+  ncmUrl: string;
+}
+
 export interface AmSong {
   id: string;
   name: string;
@@ -33,67 +40,126 @@ export interface AmSong {
   contentRating?: string;
 }
 
-export interface SyncResult {
-  date: string;
-  total: number;
-  found: number;
-  notFound: string[];
-  playlistId: string | null;
-  deletedPlaylists: string[];
-  errors: string[];
+export interface AmCandidate extends AmSong {
+  artworkUrl: string | null;
+  url: string | null;
+  score: number;
+  source: 'catalog' | 'itunes';
 }
 
-// ── Extended types for multi-phase sync ──
+export type SyncSource = 'manual' | 'cron';
+export type SyncStatus = 'running' | 'done' | 'error' | 'cancelled';
+export type SyncState =
+  | 'collecting'
+  | 'searching'
+  | 'review_required'
+  | 'creating_playlist'
+  | 'adding_tracks'
+  | 'cleaning_old_playlists'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+export type MatchStatus = 'pending' | 'matched' | 'needs_review' | 'skipped' | 'error';
+export type MatchDecisionSource = 'automatic' | 'manual' | 'skipped' | null;
 
-export interface NcmSongDisplay {
-  id: number;
-  name: string;
-  artist: string;
-  album: string;
-  cover: string;       // album art URL
-  ncmUrl: string;      // link to NCM song page
+export interface SyncIssue {
+  id: string;
+  scope: 'session' | 'song';
+  severity: 'error' | 'warning';
+  phase: number;
+  code: string;
+  message: string;
+  retryable: boolean;
+  createdAt: number;
+  ncmId?: number;
 }
 
-export interface AmSearchResult {
+export interface SongMatch {
   ncmId: number;
   ncmName: string;
   ncmArtist: string;
-  amId: string | null;
-  amName: string | null;
-  amArtist: string | null;
-  amAlbum: string | null;
-  status: 'found' | 'not_found' | 'error';
-  error?: string;
+  ncmAlbum: string;
+  ncmCover: string;
+  ncmUrl: string;
+  query: string;
+  status: MatchStatus;
+  decisionSource: MatchDecisionSource;
+  selectedCandidate: AmCandidate | null;
+  candidates: AmCandidate[];
+  issues: SyncIssue[];
 }
 
 export interface SyncSession {
   id: string;
-  phase: number;               // current phase (1-5)
-  status: 'running' | 'done' | 'error';
-  auto: boolean;               // auto-skip missing songs
+  source: SyncSource;
+  auto: boolean;
   createdAt: number;
+  updatedAt: number;
+  replacedBy: string | null;
 
-  // Phase 1 output
+  phase: number;
+  state: SyncState;
+  status: SyncStatus;
+
+  date: string;
+  storefront: string;
+  accountLabel: string;
+
   ncmSongs: NcmSongDisplay[];
   ncmTotal: number;
-  date: string;
 
-  // Phase 2 output
-  amResults: AmSearchResult[];
-  amBatchIndex: number;        // which batch we're on
-  amBatchSize: number;         // songs per batch
-  storefront: string;
+  songMatches: SongMatch[];
+  searchBatchIndex: number;
+  searchBatchSize: number;
 
-  // Phase 3 output
   playlistId: string | null;
   playlistName: string;
-
-  // Phase 4 output
   addedCount: number;
-
-  // Phase 5 output
   deletedPlaylists: string[];
 
-  // Final
-  errors: string[];
+  issues: SyncIssue[];
+}
+
+export interface PhaseSummary {
+  phase: number;
+  title: string;
+  status: 'pending' | 'running' | 'done' | 'error';
+  detail: string;
+}
+
+export interface SyncProgress {
+  processed: number;
+  total: number;
+  matched: number;
+  review: number;
+  skipped: number;
+  errors: number;
+}
+
+export interface SyncResponse {
+  sessionId: string;
+  currentPhase: number;
+  status: SyncStatus;
+  state: SyncState;
+  source: SyncSource;
+  auto: boolean;
+  active: boolean;
+  progress: SyncProgress;
+  phaseSummary: PhaseSummary[];
+  data: {
+    createdAt: number;
+    updatedAt: number;
+    replacedBy: string | null;
+    date: string;
+    ncmSongs: NcmSongDisplay[];
+    ncmTotal: number;
+    songMatches: SongMatch[];
+    storefront: string;
+    accountLabel: string;
+    playlistId: string | null;
+    playlistName: string;
+    addedCount: number;
+    deletedPlaylists: string[];
+  };
+  issues: SyncIssue[];
 }

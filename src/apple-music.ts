@@ -1,10 +1,8 @@
-import type { AmSong, Env } from './types';
+import type { AmCandidate, AmSong } from './types';
 
 const AM_API = 'https://api.music.apple.com/v1';
+const CANDIDATE_LIMIT = 5;
 
-/**
- * Generate Apple Music developer token (JWT with ES256)
- */
 export async function createDeveloperToken(
   teamId: string,
   keyId: string,
@@ -15,21 +13,14 @@ export async function createDeveloperToken(
   const payload = {
     iss: teamId,
     iat: now,
-    exp: now + 6 * 30 * 24 * 3600, // 6 months
+    exp: now + 6 * 30 * 24 * 3600,
   };
 
   const enc = new TextEncoder();
-  const headerB64 = btoa(JSON.stringify(header))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  const payloadB64 = btoa(JSON.stringify(payload))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+  const headerB64 = btoa(JSON.stringify(header)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const payloadB64 = btoa(JSON.stringify(payload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const signingInput = `${headerB64}.${payloadB64}`;
 
-  // Import ES256 private key from PEM
   const pemBody = privateKeyPem
     .replace(/-----BEGIN PRIVATE KEY-----/, '')
     .replace(/-----END PRIVATE KEY-----/, '')
@@ -58,22 +49,23 @@ export async function createDeveloperToken(
   return `${signingInput}.${sigB64}`;
 }
 
-/**
- * Apple Music API request helper
- */
 async function amFetch(
   path: string,
   developerToken: string,
-  userToken: string,
-  options: { method?: string; body?: any } = {},
+  userToken?: string,
+  options: { method?: string; body?: unknown } = {},
 ): Promise<any> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${developerToken}`,
+    'Content-Type': 'application/json',
+  };
+  if (userToken) {
+    headers['Music-User-Token'] = userToken;
+  }
+
   const resp = await fetch(`${AM_API}${path}`, {
     method: options.method || 'GET',
-    headers: {
-      Authorization: `Bearer ${developerToken}`,
-      'Music-User-Token': userToken,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
 
@@ -82,154 +74,220 @@ async function amFetch(
     throw new Error(`AM API ${path}: ${resp.status} ${text.substring(0, 200)}`);
   }
 
+  if (resp.status === 204) {
+    return null;
+  }
+
   return resp.json();
 }
 
-/**
- * Search Apple Music catalog for a song
- * Uses iTunes Search API (no auth needed) as primary, catalog as fallback
- */
+function uniqueQueries(queries: string[]): string[] {
+  return Array.from(new Set(queries.map((query) => query.trim()).filter(Boolean)));
+}
+
+function buildQueries(songName: string, artist: string, manualQuery?: string): string[] {
+  if (manualQuery?.trim()) {
+    return uniqueQueries([manualQuery]);
+  }
+
+  const cleanName = songName.replace(/\s*[\(（]feat\.?[^)）]*[)）]/gi, '').trim();
+  const queries = [`${songName} ${artist}`];
+
+  if (cleanName && cleanName !== songName) {
+    queries.push(`${cleanName} ${artist}`);
+  }
+
+  if (artist.includes('/')) {
+    const firstArtist = artist.split('/')[0]?.trim();
+    if (firstArtist) {
+      queries.push(`${songName} ${firstArtist}`);
+      if (cleanName && cleanName !== songName) {
+        queries.push(`${cleanName} ${firstArtist}`);
+      }
+    }
+  }
+
+  return uniqueQueries(queries);
+}
+
+function normalizeArtworkUrl(url?: string): string | null {
+  if (!url) return null;
+  return url.replace('{w}', '240').replace('{h}', '240');
+}
+
+function normalizeCatalogCandidate(song: any, score: number): AmCandidate {
+  return {
+    id: String(song.id),
+    name: song.attributes.name,
+    artist: song.attributes.artistName,
+    album: song.attributes.albumName || '',
+    contentRating: song.attributes.contentRating || '',
+    artworkUrl: normalizeArtworkUrl(song.attributes.artwork?.url),
+    url: song.attributes.url || null,
+    score,
+    source: 'catalog',
+  };
+}
+
+function normalizeItunesCandidate(song: any, score: number): AmCandidate {
+  return {
+    id: String(song.trackId),
+    name: song.trackName,
+    artist: song.artistName,
+    album: song.collectionName || '',
+    contentRating: song.contentRating || '',
+    artworkUrl: song.artworkUrl100 || null,
+    url: song.trackViewUrl || null,
+    score,
+    source: 'itunes',
+  };
+}
+
+function scoreSong(
+  song: any,
+  songName: string,
+  artist: string,
+  manualQuery?: string,
+): number {
+  const cleanName = songName.replace(/\s*[\(（]feat\.?[^)）]*[)）]/gi, '').trim();
+  const isLive = /[\(\[]live[\)\]]/i.test(songName) || /- live$/i.test(songName);
+  const sName = (song.name || song.trackName || '').toLowerCase();
+  const sArtist = (song.artistName || song.artist || '').toLowerCase();
+  const songLower = songName.toLowerCase();
+  const cleanLower = cleanName.toLowerCase();
+  const artistLower = artist.toLowerCase();
+  const manualLower = manualQuery?.toLowerCase().trim() || '';
+  let score = 0;
+
+  if (sName === songLower || sName === cleanLower) score += 10;
+  else if (cleanLower && (sName.includes(cleanLower) || cleanLower.includes(sName))) score += 5;
+
+  if (sArtist === artistLower) score += 8;
+  else if (artist.split('/').some((name) => sArtist.includes(name.trim().toLowerCase()))) score += 4;
+
+  const sIsLive = /[\(\[]live[\)\]]/i.test(sName) || /- live/i.test(sName);
+  if (!isLive && sIsLive) score -= 15;
+  if (isLive && sIsLive) score += 2;
+
+  if (song.contentRating === 'explicit') score += 3;
+
+  if (manualLower) {
+    if (sName.includes(manualLower)) score += 2;
+    if (sArtist.includes(manualLower)) score += 1;
+  }
+
+  return score;
+}
+
+function mergeCandidates(candidateLists: AmCandidate[][]): AmCandidate[] {
+  const merged = new Map<string, AmCandidate>();
+
+  for (const list of candidateLists) {
+    for (const candidate of list) {
+      const existing = merged.get(candidate.id);
+      if (!existing || candidate.score > existing.score) {
+        merged.set(candidate.id, candidate);
+      }
+    }
+  }
+
+  return Array.from(merged.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, CANDIDATE_LIMIT);
+}
+
+export async function searchSongCandidates(
+  songName: string,
+  artist: string,
+  storefront: string,
+  developerToken: string,
+  manualQuery?: string,
+): Promise<AmCandidate[]> {
+  const queries = buildQueries(songName, artist, manualQuery);
+  const allLists: AmCandidate[][] = [];
+
+  for (const query of queries) {
+    try {
+      const encoded = encodeURIComponent(query);
+      const data = await amFetch(
+        `/catalog/${storefront}/search?term=${encoded}&types=songs&limit=${CANDIDATE_LIMIT}`,
+        developerToken,
+      );
+      const songs = data?.results?.songs?.data || [];
+      allLists.push(
+        songs.map((song: any) =>
+          normalizeCatalogCandidate(song, scoreSong(song.attributes, songName, artist, manualQuery)),
+        ),
+      );
+    } catch {
+      // Fall through to iTunes for this query.
+    }
+
+    try {
+      const encoded = encodeURIComponent(query);
+      const resp = await fetch(
+        `https://itunes.apple.com/search?term=${encoded}&entity=song&limit=${CANDIDATE_LIMIT}&country=${storefront}`,
+      );
+      if (resp.ok) {
+        const data: any = await resp.json();
+        const songs = data.results || [];
+        allLists.push(
+          songs.map((song: any) =>
+            normalizeItunesCandidate(song, scoreSong(song, songName, artist, manualQuery)),
+          ),
+        );
+      }
+    } catch {
+      // Ignore per-query iTunes failures too.
+    }
+  }
+
+  return mergeCandidates(allLists);
+}
+
 export async function searchSong(
   songName: string,
   artist: string,
   storefront: string,
   developerToken: string,
 ): Promise<AmSong | null> {
-  const cleanName = songName
-    .replace(/\s*[\(（]feat\.?[^)）]*[)）]/gi, '')
-    .trim();
-  const isLive = /[\(\[]live[\)\]]/i.test(songName) || /- live$/i.test(songName);
-
-  // Build search queries
-  const queries = [`${songName} ${artist}`];
-  if (cleanName !== songName) queries.push(`${cleanName} ${artist}`);
-  if (artist.includes('/')) {
-    const firstArtist = artist.split('/')[0].trim();
-    queries.push(`${songName} ${firstArtist}`);
-    if (cleanName !== songName) queries.push(`${cleanName} ${firstArtist}`);
-  }
-
-  // Try catalog API first
-  for (const query of queries) {
-    try {
-      const encoded = encodeURIComponent(query);
-      const data = await amFetch(
-        `/catalog/${storefront}/search?term=${encoded}&types=songs&limit=10`,
-        developerToken,
-        '', // no user token needed for catalog search
-      );
-
-      const songs = data.results?.songs?.data || [];
-      if (songs.length > 0) {
-        const scored = songs.map((s: any) => ({
-          song: {
-            id: s.id,
-            name: s.attributes.name,
-            artist: s.attributes.artistName,
-            album: s.attributes.albumName,
-            contentRating: s.attributes.contentRating || '',
-          },
-          score: scoreSong(s.attributes, songName, cleanName, artist, isLive),
-        }));
-
-        scored.sort((a: any, b: any) => b.score - a.score);
-        if (scored[0].score >= 0) return scored[0].song;
-      }
-    } catch {
-      // continue to next query
-    }
-  }
-
-  // Fallback: iTunes Search API
-  for (const query of queries) {
-    try {
-      const encoded = encodeURIComponent(query);
-      const resp = await fetch(
-        `https://itunes.apple.com/search?term=${encoded}&entity=song&limit=10&country=${storefront}`,
-      );
-      if (!resp.ok) continue;
-      const data: any = await resp.json();
-
-      const songs = data.results || [];
-      if (songs.length > 0) {
-        const scored = songs.map((s: any) => ({
-          song: {
-            id: String(s.trackId),
-            name: s.trackName,
-            artist: s.artistName,
-            album: s.collectionName,
-            contentRating: s.contentRating || '',
-          },
-          score: scoreSong(s, songName, cleanName, artist, isLive),
-        }));
-
-        scored.sort((a: any, b: any) => b.score - a.score);
-        if (scored[0].score >= 0) return scored[0].song;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
+  const candidates = await searchSongCandidates(songName, artist, storefront, developerToken);
+  const first = candidates[0];
+  if (!first) return null;
+  return {
+    id: first.id,
+    name: first.name,
+    artist: first.artist,
+    album: first.album,
+    contentRating: first.contentRating,
+  };
 }
 
-function scoreSong(
-  s: any,
-  songName: string,
-  cleanName: string,
-  artist: string,
-  isLive: boolean,
-): number {
-  let score = 0;
-  const sName = (s.name || s.trackName || '').toLowerCase();
-  const sArtist = (s.artistName || s.artist || '').toLowerCase();
-  const songLower = songName.toLowerCase();
-  const cleanLower = cleanName.toLowerCase();
-  const artistLower = artist.toLowerCase();
-
-  // Exact name match
-  if (sName === songLower || sName === cleanLower) score += 10;
-  // Partial name match
-  else if (sName.includes(cleanLower) || cleanLower.includes(sName)) score += 5;
-
-  // Artist match
-  if (sArtist === artistLower) score += 8;
-  else if (
-    artist
-      .split('/')
-      .some((a) => sArtist.includes(a.trim().toLowerCase()))
-  )
-    score += 4;
-
-  // Penalize Live if original is not Live
-  const sIsLive = /[\(\[]live[\)\]]/i.test(sName) || /- live/i.test(sName);
-  if (!isLive && sIsLive) score -= 15;
-  if (isLive && sIsLive) score += 2;
-
-  // Prefer explicit
-  if (s.contentRating === 'explicit') score += 3;
-
-  return score;
-}
-
-/**
- * List library playlists
- */
 export async function listPlaylists(
   developerToken: string,
   userToken: string,
 ): Promise<{ id: string; name: string }[]> {
-  const data = await amFetch('/me/library/playlists', developerToken, userToken);
-  return (data.data || []).map((p: any) => ({
-    id: p.id,
-    name: p.attributes.name,
-  }));
+  const playlists: { id: string; name: string }[] = [];
+  let nextPath: string | null = '/me/library/playlists';
+
+  while (nextPath) {
+    const data = await amFetch(nextPath, developerToken, userToken);
+    for (const playlist of data?.data || []) {
+      playlists.push({
+        id: playlist.id,
+        name: playlist.attributes.name,
+      });
+    }
+
+    nextPath = data?.next || null;
+    if (nextPath?.startsWith(AM_API)) {
+      nextPath = nextPath.slice(AM_API.length);
+    }
+  }
+
+  return playlists;
 }
 
-/**
- * Create a new playlist in the user's library
- */
 export async function createPlaylist(
   name: string,
   developerToken: string,
@@ -239,22 +297,24 @@ export async function createPlaylist(
     method: 'POST',
     body: { attributes: { name } },
   });
-  return data.data.id;
+  const playlist = Array.isArray(data?.data) ? data.data[0] : data?.data;
+  if (!playlist?.id) {
+    throw new Error('AM API create playlist returned no playlist id');
+  }
+  return String(playlist.id);
 }
 
-/**
- * Add songs to a playlist
- */
 export async function addSongsToPlaylist(
   playlistId: string,
   songIds: string[],
   developerToken: string,
   userToken: string,
 ): Promise<void> {
-  // Apple Music API limits ~100 songs per request
-  const BATCH = 50;
-  for (let i = 0; i < songIds.length; i += BATCH) {
-    const batch = songIds.slice(i, i + BATCH);
+  const uniqueIds = Array.from(new Set(songIds));
+  const batchSize = 50;
+
+  for (let i = 0; i < uniqueIds.length; i += batchSize) {
+    const batch = uniqueIds.slice(i, i + batchSize);
     await amFetch(
       `/me/library/playlists/${playlistId}/tracks`,
       developerToken,
@@ -269,20 +329,25 @@ export async function addSongsToPlaylist(
   }
 }
 
-/**
- * Delete a playlist
- */
 export async function deletePlaylist(
   playlistId: string,
   developerToken: string,
   userToken: string,
 ): Promise<void> {
-  await fetch(`${AM_API}/me/library/playlists/${playlistId}`, {
+  const resp = await fetch(`${AM_API}/me/library/playlists/${playlistId}`, {
     method: 'DELETE',
     headers: {
       Authorization: `Bearer ${developerToken}`,
       'Music-User-Token': userToken,
     },
   });
-  // Don't throw on 404 — playlist may already be gone
+
+  if (resp.status === 404) {
+    return;
+  }
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`AM API delete playlist: ${resp.status} ${text.substring(0, 200)}`);
+  }
 }

@@ -1,62 +1,282 @@
-import { getDailySongs, songArtist, AuthError, refreshLoginRaw, checkLogin } from './ncm';
+import { getDailySongs, AuthError, refreshLoginRaw, checkLogin } from './ncm';
 import {
   createDeveloperToken,
-  searchSong,
+  searchSongCandidates,
   listPlaylists,
   createPlaylist,
   addSongsToPlaylist,
   deletePlaylist,
 } from './apple-music';
-import type { Env, NcmSong, NcmSongDisplay, AmSearchResult, SyncSession } from './types';
+import type {
+  AmCandidate,
+  Env,
+  NcmSong,
+  NcmSongDisplay,
+  PhaseSummary,
+  SongMatch,
+  SyncIssue,
+  SyncProgress,
+  SyncResponse,
+  SyncSession,
+  SyncSource,
+} from './types';
 
 const PLAYLIST_PREFIX_DEFAULT = 'NCM Daily ';
 const KEEP_DAYS_DEFAULT = 3;
 const STOREFRONT_DEFAULT = 'jp';
-const SESSION_TTL = 3600;          // 1 hour
-const BATCH_SIZE = 20;             // songs per Phase 2 batch
-
-// ── Session management ──
+const ACTIVE_SESSION_KEY = 'active_session';
+const SESSION_TTL = 86400;
+const BATCH_SIZE = 10;
+const AUTO_MATCH_MIN_SCORE = 13;
+const AUTO_MATCH_MIN_GAP = 3;
 
 function newSessionId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function emptySession(id: string, auto: boolean): SyncSession {
+function now(): number {
+  return Date.now();
+}
+
+function maskUserToken(token: string): string {
+  if (token.length <= 10) return token;
+  return `${token.slice(0, 6)}...${token.slice(-4)}`;
+}
+
+function getAccountLabel(env: Env): string {
+  if (env.AM_ACCOUNT_LABEL?.trim()) {
+    return env.AM_ACCOUNT_LABEL.trim();
+  }
+  return `Music User Token ${maskUserToken(env.AM_USER_TOKEN)}`;
+}
+
+function createIssue(input: Omit<SyncIssue, 'id' | 'createdAt'>): SyncIssue {
+  return {
+    id: newSessionId().slice(0, 12),
+    createdAt: now(),
+    ...input,
+  };
+}
+
+function createSongMatch(song: NcmSongDisplay): SongMatch {
+  return {
+    ncmId: song.id,
+    ncmName: song.name,
+    ncmArtist: song.artist,
+    ncmAlbum: song.album,
+    ncmCover: song.cover,
+    ncmUrl: song.ncmUrl,
+    query: `${song.name} ${song.artist}`.trim(),
+    status: 'pending',
+    decisionSource: null,
+    selectedCandidate: null,
+    candidates: [],
+    issues: [],
+  };
+}
+
+function emptySession(id: string, auto: boolean, source: SyncSource, accountLabel: string): SyncSession {
+  const timestamp = now();
   return {
     id,
-    phase: 1,
-    status: 'running',
+    source,
     auto,
-    createdAt: Date.now(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    replacedBy: null,
+    phase: 1,
+    state: 'collecting',
+    status: 'running',
+    date: '',
+    storefront: '',
+    accountLabel,
     ncmSongs: [],
     ncmTotal: 0,
-    date: '',
-    amResults: [],
-    amBatchIndex: 0,
-    amBatchSize: BATCH_SIZE,
-    storefront: '',
+    songMatches: [],
+    searchBatchIndex: 0,
+    searchBatchSize: BATCH_SIZE,
     playlistId: null,
     playlistName: '',
     addedCount: 0,
     deletedPlaylists: [],
-    errors: [],
+    issues: [],
   };
 }
 
-export async function createSession(env: Env, auto: boolean): Promise<SyncSession> {
-  // Clear any existing active session
-  const oldId = await env.KV.get('active_session');
-  if (oldId) {
-    await env.KV.delete(`session:${oldId}`);
+function isTerminal(session: SyncSession): boolean {
+  return session.status === 'done' || session.status === 'error' || session.status === 'cancelled';
+}
+
+function addSessionIssue(session: SyncSession, issue: SyncIssue): void {
+  session.issues = session.issues.filter(
+    (existing) =>
+      !(
+        existing.phase === issue.phase &&
+        existing.code === issue.code &&
+        existing.message === issue.message &&
+        existing.ncmId === issue.ncmId
+      ),
+  );
+  session.issues.push(issue);
+}
+
+function clearRetryableSongIssues(song: SongMatch): void {
+  song.issues = song.issues.filter((issue) => !(issue.phase === 2 && issue.retryable));
+}
+
+function addSongIssue(song: SongMatch, issue: SyncIssue): void {
+  song.issues = song.issues.filter(
+    (existing) =>
+      !(
+        existing.phase === issue.phase &&
+        existing.code === issue.code &&
+        existing.message === issue.message &&
+        existing.ncmId === issue.ncmId
+      ),
+  );
+  song.issues.push(issue);
+}
+
+function initializeSongMatches(session: SyncSession): void {
+  if (session.songMatches.length > 0) return;
+  session.songMatches = session.ncmSongs.map(createSongMatch);
+}
+
+function findSongMatch(session: SyncSession, ncmId: number): SongMatch {
+  const match = session.songMatches.find((item) => item.ncmId === ncmId);
+  if (!match) {
+    throw new Error(`Song ${ncmId} not found in this session`);
+  }
+  return match;
+}
+
+function shouldAutoSelect(candidates: AmCandidate[]): boolean {
+  const best = candidates[0];
+  const next = candidates[1];
+  if (!best) return false;
+  if (best.score < AUTO_MATCH_MIN_SCORE) return false;
+  if (!next) return true;
+  return best.score - next.score >= AUTO_MATCH_MIN_GAP;
+}
+
+function applyCandidates(song: SongMatch, candidates: AmCandidate[], decisionSource: SongMatch['decisionSource']): void {
+  clearRetryableSongIssues(song);
+  song.candidates = candidates;
+  song.selectedCandidate = candidates[0] || null;
+  song.query = song.query.trim();
+  if (candidates.length === 0) {
+    song.status = 'needs_review';
+    song.decisionSource = null;
+    song.selectedCandidate = null;
+    return;
   }
 
-  const id = newSessionId();
-  const session = emptySession(id, auto);
-  await saveSession(env, session);
-  await env.KV.put('active_session', id, { expirationTtl: SESSION_TTL });
-  return session;
+  if (decisionSource === 'automatic' && shouldAutoSelect(candidates)) {
+    song.status = 'matched';
+    song.decisionSource = 'automatic';
+    song.selectedCandidate = candidates[0];
+    return;
+  }
+
+  song.status = 'needs_review';
+  song.decisionSource = null;
+}
+
+function buildProgress(session: SyncSession): SyncProgress {
+  const matches = session.songMatches;
+  return {
+    processed: matches.filter((song) => song.status !== 'pending').length,
+    total: session.ncmTotal,
+    matched: matches.filter((song) => song.status === 'matched').length,
+    review: matches.filter((song) => song.status === 'needs_review').length,
+    skipped: matches.filter((song) => song.status === 'skipped').length,
+    errors: matches.filter((song) => song.status === 'error').length,
+  };
+}
+
+function buildPhaseSummary(session: SyncSession): PhaseSummary[] {
+  const progress = buildProgress(session);
+  const failedPhase = session.status === 'error' ? session.phase : null;
+  const titles = [
+    '',
+    '收集网易云日推',
+    '搜索 Apple Music',
+    '创建播放列表',
+    '添加歌曲',
+    '删除旧歌单',
+  ];
+
+  return [1, 2, 3, 4, 5].map((phase) => {
+    let status: PhaseSummary['status'] = 'pending';
+    if (failedPhase === phase) {
+      status = 'error';
+    } else if (
+      phase < session.phase ||
+      (phase === 2 && (session.state === 'review_required' || session.phase > 2)) ||
+      (phase === 5 && session.status === 'done')
+    ) {
+      status = 'done';
+    } else if (
+      (phase === 1 && session.state === 'collecting') ||
+      (phase === 2 && (session.state === 'searching' || session.state === 'review_required')) ||
+      (phase === 3 && session.state === 'creating_playlist') ||
+      (phase === 4 && session.state === 'adding_tracks') ||
+      (phase === 5 && session.state === 'cleaning_old_playlists')
+    ) {
+      status = 'running';
+    }
+
+    let detail = '';
+    switch (phase) {
+      case 1:
+        detail = session.ncmTotal ? `已收集 ${session.ncmTotal} 首歌曲` : '等待开始收集歌曲';
+        break;
+      case 2:
+        detail = `${progress.matched} 首已确认，${progress.review} 首待处理，${progress.errors} 首出错`;
+        break;
+      case 3:
+        detail = session.playlistName ? `歌单：${session.playlistName}` : '等待创建 Apple Music 歌单';
+        break;
+      case 4:
+        detail = `已添加 ${session.addedCount} 首歌曲`;
+        break;
+      case 5:
+        detail = session.deletedPlaylists.length
+          ? `已清理 ${session.deletedPlaylists.length} 个旧歌单`
+          : '等待清理旧歌单';
+        break;
+    }
+
+    return {
+      phase,
+      title: titles[phase],
+      status,
+      detail,
+    };
+  });
+}
+
+function collectIssues(session: SyncSession): SyncIssue[] {
+  return [...session.issues, ...session.songMatches.flatMap((song) => song.issues)].sort(
+    (left, right) => left.createdAt - right.createdAt,
+  );
+}
+
+async function getActiveSessionId(env: Env): Promise<string | null> {
+  return env.KV.get(ACTIVE_SESSION_KEY);
+}
+
+async function setActiveSessionId(env: Env, id: string): Promise<void> {
+  await env.KV.put(ACTIVE_SESSION_KEY, id, { expirationTtl: SESSION_TTL });
+}
+
+async function clearActiveSessionIfMatches(env: Env, id: string): Promise<void> {
+  const current = await getActiveSessionId(env);
+  if (current === id) {
+    await env.KV.delete(ACTIVE_SESSION_KEY);
+  }
 }
 
 export async function getSession(env: Env, id: string): Promise<SyncSession | null> {
@@ -64,326 +284,511 @@ export async function getSession(env: Env, id: string): Promise<SyncSession | nu
   return raw as SyncSession | null;
 }
 
+export async function getActiveSession(env: Env): Promise<SyncSession | null> {
+  const activeId = await getActiveSessionId(env);
+  if (!activeId) return null;
+  return getSession(env, activeId);
+}
+
 export async function saveSession(env: Env, session: SyncSession): Promise<void> {
+  session.updatedAt = now();
   await env.KV.put(`session:${session.id}`, JSON.stringify(session), { expirationTtl: SESSION_TTL });
 }
 
-// ── NCM cookie helper ──
+async function failSession(
+  env: Env,
+  session: SyncSession,
+  phase: number,
+  code: string,
+  message: string,
+): Promise<SyncSession> {
+  session.phase = phase;
+  session.state = 'failed';
+  session.status = 'error';
+  addSessionIssue(
+    session,
+    createIssue({
+      scope: 'session',
+      severity: 'error',
+      phase,
+      code,
+      message,
+      retryable: false,
+    }),
+  );
+  await saveSession(env, session);
+  await clearActiveSessionIfMatches(env, session.id);
+  return session;
+}
+
+async function replaceActiveSession(env: Env, replacementId: string): Promise<void> {
+  const active = await getActiveSession(env);
+  if (!active || isTerminal(active)) {
+    if (active) {
+      await clearActiveSessionIfMatches(env, active.id);
+    }
+    return;
+  }
+
+  active.status = 'cancelled';
+  active.state = 'cancelled';
+  active.replacedBy = replacementId;
+  addSessionIssue(
+    active,
+    createIssue({
+      scope: 'session',
+      severity: 'warning',
+      phase: active.phase,
+      code: 'session_replaced',
+      message: `Session replaced by ${replacementId}`,
+      retryable: false,
+    }),
+  );
+  await saveSession(env, active);
+}
 
 async function getValidCookie(env: Env): Promise<string> {
-  let cookie = env.NCM_COOKIE;
-  const status = await checkLogin(cookie);
-  if (status.ok) return cookie;
+  const savedCookie = await env.KV.get('ncm_cookie');
+  const cookieCandidates = [savedCookie, env.NCM_COOKIE].filter(Boolean) as string[];
 
-  console.log('[NCM] Cookie expired, attempting refresh...');
-  const newCookie = await refreshLoginRaw(cookie);
-  if (newCookie) {
-    const recheck = await checkLogin(newCookie);
-    if (recheck.ok) {
-      console.log('[NCM] Refresh successful');
-      await env.KV.put('ncm_cookie', newCookie, { expirationTtl: 86400 * 60 });
-      return newCookie;
+  for (const candidate of cookieCandidates) {
+    const status = await checkLogin(candidate);
+    if (status.ok) {
+      return candidate;
     }
   }
 
-  const saved = await env.KV.get('ncm_cookie');
-  if (saved) {
-    const savedStatus = await checkLogin(saved);
-    if (savedStatus.ok) {
-      console.log('[NCM] Using saved cookie from KV');
-      return saved;
+  for (const candidate of cookieCandidates) {
+    const refreshed = await refreshLoginRaw(candidate);
+    if (!refreshed) continue;
+    const recheck = await checkLogin(refreshed);
+    if (recheck.ok) {
+      await env.KV.put('ncm_cookie', refreshed, { expirationTtl: 86400 * 60 });
+      return refreshed;
     }
   }
 
   throw new Error('NCM cookie expired and refresh failed. Please re-login via /login');
 }
 
-// ── Developer token helper ──
-
 async function getDeveloperToken(env: Env): Promise<string> {
   if (env.AM_DEVELOPER_TOKEN) return env.AM_DEVELOPER_TOKEN;
-  return createDeveloperToken(env.AM_TEAM_ID!, env.AM_KEY_ID!, env.AM_PRIVATE_KEY!);
+  if (!env.AM_TEAM_ID || !env.AM_KEY_ID || !env.AM_PRIVATE_KEY) {
+    throw new Error('Apple Music developer token is not configured');
+  }
+  return createDeveloperToken(env.AM_TEAM_ID, env.AM_KEY_ID, env.AM_PRIVATE_KEY);
 }
 
-// ── Phase 1: Fetch NCM daily songs ──
+function ensureMutableSession(session: SyncSession, activeId: string | null): void {
+  if (session.status === 'cancelled') {
+    throw new Error(`Session was replaced by ${session.replacedBy || 'another session'}`);
+  }
+  if (session.status !== 'running') {
+    throw new Error(`Session is not active (${session.status})`);
+  }
+  if (activeId !== session.id) {
+    throw new Error('Session is no longer the active session');
+  }
+}
+
+export async function startManualSession(env: Env, auto: boolean): Promise<SyncSession> {
+  const id = newSessionId();
+  await replaceActiveSession(env, id);
+
+  const session = emptySession(id, auto, 'manual', getAccountLabel(env));
+  await saveSession(env, session);
+  await setActiveSessionId(env, id);
+  return session;
+}
+
+export async function startCronSession(env: Env): Promise<SyncSession | null> {
+  const active = await getActiveSession(env);
+  if (active && !isTerminal(active)) {
+    return null;
+  }
+  if (active) {
+    await clearActiveSessionIfMatches(env, active.id);
+  }
+
+  const id = newSessionId();
+  const session = emptySession(id, true, 'cron', getAccountLabel(env));
+  await saveSession(env, session);
+  await setActiveSessionId(env, id);
+  return session;
+}
+
+export async function getSessionResponse(env: Env, id?: string): Promise<SyncResponse | null> {
+  const session = id ? await getSession(env, id) : await getActiveSession(env);
+  if (!session) return null;
+  const activeId = await getActiveSessionId(env);
+  return toSyncResponse(session, activeId === session.id);
+}
+
+export async function getMutableSession(env: Env, id: string): Promise<SyncSession> {
+  const session = await getSession(env, id);
+  if (!session) {
+    throw new Error('Session not found or expired');
+  }
+  const activeId = await getActiveSessionId(env);
+  ensureMutableSession(session, activeId);
+  return session;
+}
+
+function toSyncResponse(session: SyncSession, active: boolean): SyncResponse {
+  return {
+    sessionId: session.id,
+    currentPhase: session.phase,
+    status: session.status,
+    state: session.state,
+    source: session.source,
+    auto: session.auto,
+    active,
+    progress: buildProgress(session),
+    phaseSummary: buildPhaseSummary(session),
+    data: {
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      replacedBy: session.replacedBy,
+      date: session.date,
+      ncmSongs: session.ncmSongs,
+      ncmTotal: session.ncmTotal,
+      songMatches: session.songMatches,
+      storefront: session.storefront,
+      accountLabel: session.accountLabel,
+      playlistId: session.playlistId,
+      playlistName: session.playlistName,
+      addedCount: session.addedCount,
+      deletedPlaylists: session.deletedPlaylists,
+    },
+    issues: collectIssues(session),
+  };
+}
 
 export async function phase1(env: Env, session: SyncSession): Promise<SyncSession> {
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
-  session.date = now.toISOString().slice(0, 10);
+  const nowDate = new Date(Date.now() + 8 * 3600 * 1000);
+  session.phase = 1;
+  session.state = 'collecting';
+  session.status = 'running';
+  session.date = nowDate.toISOString().slice(0, 10);
 
   try {
     const cookie = await getValidCookie(env);
 
     let songs: NcmSong[];
     try {
-      const r = await getDailySongs(cookie);
-      songs = r.songs;
-    } catch (e: any) {
-      if (e instanceof AuthError) {
-        const newCookie = await refreshLoginRaw(cookie);
-        if (newCookie) {
-          await env.KV.put('ncm_cookie', newCookie, { expirationTtl: 86400 * 60 });
-          const r = await getDailySongs(newCookie);
-          songs = r.songs;
-        } else {
-          throw new Error('NCM auth expired and refresh failed');
-        }
-      } else {
-        throw e;
+      const response = await getDailySongs(cookie);
+      songs = response.songs;
+    } catch (error) {
+      if (!(error instanceof AuthError)) {
+        throw error;
       }
+
+      const refreshedCookie = await refreshLoginRaw(cookie);
+      if (!refreshedCookie) {
+        throw new Error('NCM auth expired and refresh failed');
+      }
+
+      await env.KV.put('ncm_cookie', refreshedCookie, { expirationTtl: 86400 * 60 });
+      const response = await getDailySongs(refreshedCookie);
+      songs = response.songs;
     }
 
-    session.ncmTotal = songs.length;
-    session.ncmSongs = songs.map((s: NcmSong) => ({
-      id: s.id,
-      name: s.name,
-      artist: s.artists.map(a => a.name).join(' / '),
-      album: s.album.name,
-      cover: s.cover || '',
-      ncmUrl: `https://music.163.com/song?id=${s.id}`,
+    session.ncmSongs = songs.map((song: NcmSong) => ({
+      id: song.id,
+      name: song.name,
+      artist: song.artists.map((artist) => artist.name).join(' / '),
+      album: song.album.name,
+      cover: song.cover || '',
+      ncmUrl: `https://music.163.com/song?id=${song.id}`,
     }));
-
+    session.ncmTotal = session.ncmSongs.length;
+    session.songMatches = [];
+    session.searchBatchIndex = 0;
     session.phase = 2;
-    session.status = 'running';
-  } catch (e: any) {
-    session.status = 'error';
-    session.errors.push(`Phase 1 failed: ${e.message}`);
+    session.state = 'searching';
+    await saveSession(env, session);
+    return session;
+  } catch (error) {
+    return failSession(env, session, 1, 'phase1_failed', (error as Error).message);
   }
-
-  await saveSession(env, session);
-  return session;
 }
 
-// ── Phase 2: Search Apple Music (batched) ──
+function markRemainingAsSkipped(session: SyncSession): void {
+  for (const song of session.songMatches) {
+    if (song.status === 'matched' || song.status === 'skipped') continue;
+    song.status = 'skipped';
+    song.decisionSource = 'skipped';
+    song.selectedCandidate = null;
+  }
+}
 
 export async function phase2(env: Env, session: SyncSession): Promise<SyncSession> {
-  const storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
-  session.storefront = storefront;
+  session.phase = 2;
+  session.state = 'searching';
+  session.status = 'running';
+  session.storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
+  session.accountLabel = getAccountLabel(env);
 
   try {
     const developerToken = await getDeveloperToken(env);
+    initializeSongMatches(session);
 
-    // Initialize results array if first batch
-    if (session.amResults.length === 0) {
-      session.amResults = session.ncmSongs.map(s => ({
-        ncmId: s.id,
-        ncmName: s.name,
-        ncmArtist: s.artist,
-        amId: null,
-        amName: null,
-        amArtist: null,
-        amAlbum: null,
-        status: 'not_found' as const,
-      }));
-      session.amBatchIndex = 0;
+    if (session.ncmTotal === 0) {
+      session.phase = 3;
+      session.state = 'creating_playlist';
+      await saveSession(env, session);
+      return session;
     }
 
-    const start = session.amBatchIndex * BATCH_SIZE;
-    const end = Math.min(start + BATCH_SIZE, session.ncmSongs.length);
-    const batch = session.ncmSongs.slice(start, end);
-
-    for (let i = 0; i < batch.length; i++) {
-      const song = batch[i];
-      const resultIdx = start + i;
-
-      try {
-        const match = await searchSong(song.name, song.artist, storefront, developerToken);
-        if (match) {
-          session.amResults[resultIdx] = {
-            ncmId: song.id,
-            ncmName: song.name,
-            ncmArtist: song.artist,
-            amId: match.id,
-            amName: match.name,
-            amArtist: match.artist,
-            amAlbum: match.album || null,
-            status: 'found',
-          };
-        } else {
-          session.amResults[resultIdx].status = 'not_found';
-        }
-      } catch (e: any) {
-        session.amResults[resultIdx] = {
-          ...session.amResults[resultIdx],
-          status: 'error',
-          error: e.message,
-        };
-      }
-    }
-
-    session.amBatchIndex++;
-
-    // Check if more batches needed
-    const totalBatches = Math.ceil(session.ncmSongs.length / BATCH_SIZE);
-    if (session.amBatchIndex >= totalBatches) {
-      // All batches done
-      const foundCount = session.amResults.filter(r => r.status === 'found').length;
-      const notFoundCount = session.amResults.filter(r => r.status !== 'found').length;
-
-      if (session.auto || notFoundCount === 0) {
-        // Auto-skip or all found → go to phase 3
+    const totalBatches = Math.ceil(session.songMatches.length / BATCH_SIZE);
+    if (session.searchBatchIndex >= totalBatches) {
+      const unresolved = session.songMatches.filter(
+        (song) => song.status === 'needs_review' || song.status === 'error',
+      );
+      if (session.auto) {
+        markRemainingAsSkipped(session);
         session.phase = 3;
+        session.state = 'creating_playlist';
+      } else if (unresolved.length === 0) {
+        session.phase = 3;
+        session.state = 'creating_playlist';
       } else {
-        // Wait for user to review / manually search
-        session.phase = 2.5; // intermediate: waiting for user
+        session.state = 'review_required';
+      }
+      await saveSession(env, session);
+      return session;
+    }
+
+    const start = session.searchBatchIndex * BATCH_SIZE;
+    const end = Math.min(start + BATCH_SIZE, session.songMatches.length);
+
+    for (let index = start; index < end; index += 1) {
+      const song = session.songMatches[index];
+      try {
+        const candidates = await searchSongCandidates(
+          song.ncmName,
+          song.ncmArtist,
+          session.storefront,
+          developerToken,
+          song.query,
+        );
+        applyCandidates(song, candidates, 'automatic');
+      } catch (error) {
+        const issue = createIssue({
+          scope: 'song',
+          severity: 'error',
+          phase: 2,
+          code: 'search_failed',
+          message: (error as Error).message,
+          retryable: true,
+          ncmId: song.ncmId,
+        });
+        song.status = 'error';
+        song.candidates = [];
+        song.selectedCandidate = null;
+        addSongIssue(song, issue);
       }
     }
-    // else: more batches remain, stay at phase 2
 
-    session.status = 'running';
-  } catch (e: any) {
-    session.status = 'error';
-    session.errors.push(`Phase 2 failed: ${e.message}`);
+    session.searchBatchIndex += 1;
+
+    if (session.searchBatchIndex >= totalBatches) {
+      const unresolved = session.songMatches.filter(
+        (song) => song.status === 'needs_review' || song.status === 'error',
+      );
+      if (session.auto) {
+        markRemainingAsSkipped(session);
+        session.phase = 3;
+        session.state = 'creating_playlist';
+      } else if (unresolved.length === 0) {
+        session.phase = 3;
+        session.state = 'creating_playlist';
+      } else {
+        session.state = 'review_required';
+      }
+    }
+
+    await saveSession(env, session);
+    return session;
+  } catch (error) {
+    return failSession(env, session, 2, 'phase2_failed', (error as Error).message);
   }
-
-  await saveSession(env, session);
-  return session;
 }
 
-// ── Phase 2.5: Manual search for a single song ──
-
-export async function manualSearch(
+export async function searchPhase2Candidates(
   env: Env,
   session: SyncSession,
   ncmId: number,
   query: string,
 ): Promise<SyncSession> {
-  const storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
-  const developerToken = await getDeveloperToken(env);
-
-  // Search AM with the user-provided query
-  // query format: "song name artist" or just "song name"
-  const parts = query.split(' ');
-  const songName = parts.slice(0, -1).join(' ') || query;
-  const artist = parts.length > 1 ? parts[parts.length - 1] : '';
-
   try {
-    const match = await searchSong(songName, artist || query, storefront, developerToken);
-    const idx = session.amResults.findIndex(r => r.ncmId === ncmId);
-    if (idx >= 0 && match) {
-      session.amResults[idx] = {
-        ...session.amResults[idx],
-        amId: match.id,
-        amName: match.name,
-        amArtist: match.artist,
-        amAlbum: match.album || null,
-        status: 'found',
-      };
-    }
-  } catch (e: any) {
-    // search failed, leave as not_found
+    const developerToken = await getDeveloperToken(env);
+    const song = findSongMatch(session, ncmId);
+    song.query = query.trim() || `${song.ncmName} ${song.ncmArtist}`.trim();
+    const candidates = await searchSongCandidates(
+      song.ncmName,
+      song.ncmArtist,
+      session.storefront || env.STOREFRONT || STOREFRONT_DEFAULT,
+      developerToken,
+      song.query,
+    );
+    applyCandidates(song, candidates, null);
+    session.phase = 2;
+    session.state = 'review_required';
+    await saveSession(env, session);
+    return session;
+  } catch (error) {
+    const song = findSongMatch(session, ncmId);
+    const issue = createIssue({
+      scope: 'song',
+      severity: 'error',
+      phase: 2,
+      code: 'manual_search_failed',
+      message: (error as Error).message,
+      retryable: true,
+      ncmId,
+    });
+    song.status = 'error';
+    addSongIssue(song, issue);
+    await saveSession(env, session);
+    return session;
+  }
+}
+
+export async function selectPhase2Candidate(
+  env: Env,
+  session: SyncSession,
+  ncmId: number,
+  candidateId: string,
+): Promise<SyncSession> {
+  const song = findSongMatch(session, ncmId);
+  const candidate = song.candidates.find((item) => item.id === candidateId);
+  if (!candidate) {
+    throw new Error('Candidate not found for this song');
   }
 
+  clearRetryableSongIssues(song);
+  song.selectedCandidate = candidate;
+  song.status = 'matched';
+  song.decisionSource = 'manual';
+  session.phase = 2;
+  session.state = 'review_required';
   await saveSession(env, session);
   return session;
 }
 
-// ── Phase 2 → 3: Skip remaining and proceed ──
+export async function skipPhase2Song(
+  env: Env,
+  session: SyncSession,
+  ncmId: number,
+): Promise<SyncSession> {
+  const song = findSongMatch(session, ncmId);
+  song.status = 'skipped';
+  song.decisionSource = 'skipped';
+  song.selectedCandidate = null;
+  session.phase = 2;
+  session.state = 'review_required';
+  await saveSession(env, session);
+  return session;
+}
 
-export async function skipToPhase3(env: Env, session: SyncSession): Promise<SyncSession> {
+export async function continuePhase2(env: Env, session: SyncSession): Promise<SyncSession> {
+  markRemainingAsSkipped(session);
   session.phase = 3;
+  session.state = 'creating_playlist';
   session.status = 'running';
   await saveSession(env, session);
   return session;
 }
 
-// ── Phase 3: Create playlist ──
-
 export async function phase3(env: Env, session: SyncSession): Promise<SyncSession> {
-  const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
-  session.playlistName = `${prefix}${session.date}`;
+  session.phase = 3;
+  session.state = 'creating_playlist';
+  session.status = 'running';
+  session.playlistName = `${env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT}${session.date}`;
+
+  if (session.songMatches.some((song) => song.status === 'needs_review' || song.status === 'error')) {
+    throw new Error('Review phase is incomplete');
+  }
 
   try {
     const developerToken = await getDeveloperToken(env);
-
-    // Check if playlist already exists
     const playlists = await listPlaylists(developerToken, env.AM_USER_TOKEN);
-    const existing = playlists.find(p => p.name === session.playlistName);
+    const existing = playlists.find((playlist) => playlist.name === session.playlistName);
 
-    if (existing) {
-      session.playlistId = existing.id;
-    } else {
-      const plId = await createPlaylist(session.playlistName, developerToken, env.AM_USER_TOKEN);
-      session.playlistId = plId;
-    }
-
+    session.playlistId = existing
+      ? existing.id
+      : await createPlaylist(session.playlistName, developerToken, env.AM_USER_TOKEN);
     session.phase = 4;
-    session.status = 'running';
-  } catch (e: any) {
-    session.status = 'error';
-    session.errors.push(`Phase 3 failed: ${e.message}`);
-  }
-
-  await saveSession(env, session);
-  return session;
-}
-
-// ── Phase 4: Add songs to playlist ──
-
-export async function phase4(env: Env, session: SyncSession): Promise<SyncSession> {
-  if (!session.playlistId) {
-    session.status = 'error';
-    session.errors.push('No playlist ID — run Phase 3 first');
+    session.state = 'adding_tracks';
     await saveSession(env, session);
     return session;
+  } catch (error) {
+    return failSession(env, session, 3, 'phase3_failed', (error as Error).message);
+  }
+}
+
+export async function phase4(env: Env, session: SyncSession): Promise<SyncSession> {
+  session.phase = 4;
+  session.state = 'adding_tracks';
+  session.status = 'running';
+
+  if (!session.playlistId) {
+    return failSession(env, session, 4, 'playlist_missing', 'No playlist ID — run phase 3 first');
   }
 
   try {
     const developerToken = await getDeveloperToken(env);
-    const foundIds = session.amResults
-      .filter(r => r.status === 'found' && r.amId)
-      .map(r => r.amId!);
+    const foundIds = session.songMatches
+      .filter((song) => song.status === 'matched' && song.selectedCandidate?.id)
+      .map((song) => song.selectedCandidate!.id);
 
+    session.addedCount = foundIds.length;
     if (foundIds.length > 0) {
       await addSongsToPlaylist(session.playlistId, foundIds, developerToken, env.AM_USER_TOKEN);
-      session.addedCount = foundIds.length;
     }
 
     session.phase = 5;
-    session.status = 'running';
-  } catch (e: any) {
-    session.status = 'error';
-    session.errors.push(`Phase 4 failed: ${e.message}`);
+    session.state = 'cleaning_old_playlists';
+    await saveSession(env, session);
+    return session;
+  } catch (error) {
+    return failSession(env, session, 4, 'phase4_failed', (error as Error).message);
   }
-
-  await saveSession(env, session);
-  return session;
 }
 
-// ── Phase 5: Delete old playlists ──
-
 export async function phase5(env: Env, session: SyncSession): Promise<SyncSession> {
-  const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
-  const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
+  session.phase = 5;
+  session.state = 'cleaning_old_playlists';
+  session.status = 'running';
+  session.deletedPlaylists = [];
 
   try {
     const developerToken = await getDeveloperToken(env);
     const playlists = await listPlaylists(developerToken, env.AM_USER_TOKEN);
+    const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
+    const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
 
-    const now = new Date(Date.now() + 8 * 3600 * 1000);
-    const cutoffDate = new Date(now.getTime() - (keepDays - 1) * 86400000);
-    const cutoffStr = cutoffDate.toISOString().slice(0, 10);
+    const nowDate = new Date(Date.now() + 8 * 3600 * 1000);
+    const cutoffDate = new Date(nowDate.getTime() - (keepDays - 1) * 86400000);
+    const cutoff = cutoffDate.toISOString().slice(0, 10);
 
-    for (const pl of playlists) {
-      if (!pl.name.startsWith(prefix)) continue;
-      const plDate = pl.name.slice(prefix.length);
-      if (/^\d{4}-\d{2}-\d{2}$/.test(plDate) && plDate < cutoffStr) {
-        try {
-          await deletePlaylist(pl.id, developerToken, env.AM_USER_TOKEN);
-          session.deletedPlaylists.push(pl.name);
-        } catch (e: any) {
-          session.errors.push(`Delete ${pl.name} failed: ${e.message}`);
-        }
-      }
+    for (const playlist of playlists) {
+      if (!playlist.name.startsWith(prefix)) continue;
+      const playlistDate = playlist.name.slice(prefix.length);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(playlistDate) || playlistDate >= cutoff) continue;
+      await deletePlaylist(playlist.id, developerToken, env.AM_USER_TOKEN);
+      session.deletedPlaylists.push(playlist.name);
     }
 
     session.status = 'done';
-    session.phase = 5;
-  } catch (e: any) {
-    session.status = 'error';
-    session.errors.push(`Phase 5 failed: ${e.message}`);
+    session.state = 'completed';
+    await saveSession(env, session);
+    await clearActiveSessionIfMatches(env, session.id);
+    return session;
+  } catch (error) {
+    return failSession(env, session, 5, 'phase5_failed', (error as Error).message);
   }
-
-  await saveSession(env, session);
-  return session;
 }
+
+export { toSyncResponse };
